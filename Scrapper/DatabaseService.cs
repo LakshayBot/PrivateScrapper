@@ -17,9 +17,9 @@ namespace SimpleScraper
             using var connection = new NpgsqlConnection(_connectionString);
             await connection.OpenAsync();
 
-            // Create table if it doesn't exist
-            using var command = connection.CreateCommand();
-            command.CommandText = @"
+            // Create video table if it doesn't exist
+            using var videoTableCommand = connection.CreateCommand();
+            videoTableCommand.CommandText = @"
                 CREATE TABLE IF NOT EXISTS videos (
                     id SERIAL PRIMARY KEY,
                     title TEXT NOT NULL,
@@ -29,7 +29,22 @@ namespace SimpleScraper
                     scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             ";
-            await command.ExecuteNonQueryAsync();
+            await videoTableCommand.ExecuteNonQueryAsync();
+
+            // Create channels table if it doesn't exist
+            using var channelsTableCommand = connection.CreateCommand();
+            channelsTableCommand.CommandText = @"
+                CREATE TABLE IF NOT EXISTS channels (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    last_checked TIMESTAMP DEFAULT NULL,
+                    check_interval_minutes INT DEFAULT 60,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            ";
+            await channelsTableCommand.ExecuteNonQueryAsync();
         }
 
         public async Task SaveVideosAsync(List<VideoData> videos)
@@ -82,6 +97,62 @@ namespace SimpleScraper
             }
 
             return videos;
+        }
+
+        public async Task<List<ChannelData>> GetActiveChannelsAsync()
+        {
+            using var connection = new NpgsqlConnection(_connectionString);
+            await connection.OpenAsync();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT id, name, url, check_interval_minutes FROM channels WHERE is_active = TRUE;";
+
+            using var reader = await command.ExecuteReaderAsync();
+            var channels = new List<ChannelData>();
+
+            while (await reader.ReadAsync())
+            {
+                channels.Add(new ChannelData
+                {
+                    Id = reader.GetInt32(0),
+                    Name = reader.GetString(1),
+                    Url = reader.GetString(2),
+                    CheckIntervalMinutes = reader.GetInt32(3)
+                });
+            }
+
+            return channels;
+        }
+
+        public async Task UpdateChannelLastCheckedAsync(int channelId)
+        {
+            using var connection = new NpgsqlConnection(_connectionString);
+            await connection.OpenAsync();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE channels SET last_checked = CURRENT_TIMESTAMP WHERE id = @channelId";
+            command.Parameters.AddWithValue("channelId", channelId);
+
+            await command.ExecuteNonQueryAsync();
+        }
+
+        public async Task SaveChannelAsync(string name, string url, int checkIntervalMinutes = 60)
+        {
+            using var connection = new NpgsqlConnection(_connectionString);
+            await connection.OpenAsync();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                INSERT INTO channels (name, url, check_interval_minutes) 
+                VALUES (@name, @url, @checkInterval)
+                ON CONFLICT (url) DO UPDATE 
+                SET name = @name, check_interval_minutes = @checkInterval, is_active = TRUE;
+            ";
+            command.Parameters.AddWithValue("name", name);
+            command.Parameters.AddWithValue("url", url);
+            command.Parameters.AddWithValue("checkInterval", checkIntervalMinutes);
+
+            await command.ExecuteNonQueryAsync();
         }
     }
 }
