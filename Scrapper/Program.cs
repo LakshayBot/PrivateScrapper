@@ -251,142 +251,206 @@ namespace SimpleScraper
 
         public async Task<List<VideoData>> ScrapeChannel(string channelInput, int maxVideos = 10)
         {
-            string channelUrl = NormalizeChannelUrl(channelInput);
-
-            Console.WriteLine($"Fetching channel page: {channelUrl}");
-            var html = await _httpClient.GetStringAsync(channelUrl);
-
-            var doc = new HtmlDocument();
-            doc.LoadHtml(html);
-
-            var videos = new List<VideoData>();
-            var videoNodes = FindVideoNodes(doc);
-
-            if (videoNodes == null || videoNodes.Count == 0)
+            string baseChannelUrl = NormalizeChannelUrl(channelInput);
+            var allVideos = new List<VideoData>();
+            int totalPagesScraped = 0;
+            int currentPage = 1;
+            int totalPages = 1; // We'll update this after parsing the first page
+            
+            Console.WriteLine($"Starting to scrape channel: {baseChannelUrl}");
+            
+            // Continue scraping until we reach the max videos or have scraped all pages
+            while (allVideos.Count < maxVideos && currentPage <= totalPages)
             {
-                Console.WriteLine("No videos found on this channel page.");
-                return videos;
+                // Calculate the correct offset for the current page (0-based)
+                int offset = (currentPage - 1) * 30;
+                
+                // Construct the URL for the current page
+                string channelUrl = currentPage == 1 
+                    ? baseChannelUrl 
+                    : $"{GetBaseUrlWithoutPage(baseChannelUrl)}?page={offset}";
+                    
+                Console.WriteLine($"Fetching page {currentPage}/{totalPages} (offset: {offset}): {channelUrl}");
+                var html = await _httpClient.GetStringAsync(channelUrl);
+
+                var doc = new HtmlDocument();
+                doc.LoadHtml(html);
+                
+                // On the first page, find out how many pages there are in total
+                if (currentPage == 1)
+                {
+                    totalPages = ExtractTotalPages(doc, baseChannelUrl);
+                    Console.WriteLine($"Found a total of {totalPages} pages");
+                }
+
+                var videoNodes = FindVideoNodes(doc);
+                if (videoNodes == null || videoNodes.Count == 0)
+                {
+                    Console.WriteLine($"No videos found on page {currentPage}. Moving to next page.");
+                    currentPage++;
+                    continue;
+                }
+
+                Console.WriteLine($"Found {videoNodes.Count} videos on page {currentPage}. Processing...");
+                int processedCount = 0;
+
+                foreach (var node in videoNodes)
+                {
+                    if (allVideos.Count >= maxVideos)
+                        break;
+
+                    try
+                    {
+                        var title = ExtractTitle(node);
+                        var postUrl = ExtractUrl(node);
+
+                        if (string.IsNullOrEmpty(postUrl) || !postUrl.Contains("/post/"))
+                        {
+                            continue;
+                        }
+
+                        if (!postUrl.StartsWith("http"))
+                        {
+                            postUrl = postUrl.StartsWith("/") ? BaseUrl + postUrl : BaseUrl + "/" + postUrl;
+                        }
+
+                        var postId = ExtractPostIdFromUrl(postUrl);
+
+                        processedCount++;
+                        Console.WriteLine($"Processing video {processedCount}/{videoNodes.Count} on page {currentPage}: {title}");
+
+                        var video = new VideoData
+                        {
+                            Title = title,
+                            Url = postUrl,
+                            PostId = postId
+                        };
+
+                        // Get .vid URL from network traffic
+                        string vidUrl = await GetVideoSourceUrl(postUrl);
+                        if (!string.IsNullOrEmpty(vidUrl))
+                        {
+                            video.VideoSourceUrl = vidUrl;
+                            allVideos.Add(video);
+                            Console.WriteLine($"✅ Found .vid URL: {vidUrl}");
+                        }
+                        else
+                        {
+                            Console.WriteLine("❌ No .vid URL found for this video");
+                        }
+
+                        // Add a small delay between requests
+                        await Task.Delay(1500);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error processing a video: {ex.Message}");
+                    }
+                }
+
+                totalPagesScraped++;
+                currentPage++;
+                
+                // If this is not the last page, add a delay before fetching the next page
+                if (currentPage <= totalPages && allVideos.Count < maxVideos)
+                {
+                    Console.WriteLine($"Waiting 3 seconds before fetching the next page...");
+                    await Task.Delay(3000);
+                }
             }
 
-            Console.WriteLine($"Found {videoNodes.Count} videos on channel page. Processing...");
-            int processedCount = 0;
-
-            foreach (var node in videoNodes)
-            {
-                if (videos.Count >= maxVideos)
-                    break;
-
-                try
-                {
-                    var title = ExtractTitle(node);
-                    var postUrl = ExtractUrl(node);
-
-                    if (string.IsNullOrEmpty(postUrl) || !postUrl.Contains("/post/"))
-                    {
-                        continue;
-                    }
-
-                    if (!postUrl.StartsWith("http"))
-                    {
-                        postUrl = postUrl.StartsWith("/") ? BaseUrl + postUrl : BaseUrl + "/" + postUrl;
-                    }
-
-                    var postId = ExtractPostIdFromUrl(postUrl);
-
-                    processedCount++;
-                    Console.WriteLine($"Processing video {processedCount}/{videoNodes.Count}: {title}");
-
-                    var video = new VideoData
-                    {
-                        Title = title,
-                        Url = postUrl,
-                        PostId = postId
-                    };
-
-                    // Get .vid URL from network traffic
-                    string vidUrl = await GetVideoSourceUrl(postUrl);
-                    if (!string.IsNullOrEmpty(vidUrl))
-                    {
-                        video.VideoSourceUrl = vidUrl;
-                        videos.Add(video);
-                        Console.WriteLine($"✅ Found .vid URL: {vidUrl}");
-                    }
-                    else
-                    {
-                        Console.WriteLine("❌ No .vid URL found for this video");
-                    }
-
-                    // Add a small delay between requests
-                    await Task.Delay(1500);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error processing a video: {ex.Message}");
-                }
-            }
-
-            return videos;
+            Console.WriteLine($"Pagination complete. Scraped {totalPagesScraped} pages out of {totalPages} total pages.");
+            return allVideos;
         }
 
         public async Task<List<VideoData>> MonitorChannel(string channelInput, int maxVideos = 300)
         {
-            string channelUrl = NormalizeChannelUrl(channelInput);
+            string baseChannelUrl = NormalizeChannelUrl(channelInput);
+            var allVideos = new List<VideoData>();
+            int currentPage = 1;
+            int totalPages = 1;
+            
+            Console.WriteLine($"Monitoring channel: {baseChannelUrl}");
 
-            Console.WriteLine($"Fetching latest videos from: {channelUrl}");
-            var html = await _httpClient.GetStringAsync(channelUrl);
-
-            var doc = new HtmlDocument();
-            doc.LoadHtml(html);
-
-            var videos = new List<VideoData>();
-            var videoNodes = FindVideoNodes(doc);
-
-            if (videoNodes == null || videoNodes.Count == 0)
+            // We'll check only up to 3 pages when monitoring to avoid excessive requests
+            int maxPagesToCheck = 10;
+            
+            while (allVideos.Count < maxVideos && currentPage <= totalPages && currentPage <= maxPagesToCheck)
             {
-                Console.WriteLine("No videos found on this channel page.");
-                return videos;
+                // Calculate the correct offset for the current page (0-based)
+                int offset = (currentPage - 1) * 30;
+                
+                string channelUrl = currentPage == 1 
+                    ? baseChannelUrl 
+                    : $"{GetBaseUrlWithoutPage(baseChannelUrl)}?page={offset}";
+                    
+                Console.WriteLine($"Fetching page {currentPage}/{Math.Min(totalPages, maxPagesToCheck)} (offset: {offset}): {channelUrl}");
+                var html = await _httpClient.GetStringAsync(channelUrl);
+
+                var doc = new HtmlDocument();
+                doc.LoadHtml(html);
+                
+                if (currentPage == 1)
+                {
+                    totalPages = ExtractTotalPages(doc, baseChannelUrl);
+                    Console.WriteLine($"Found a total of {totalPages} pages, will check up to {Math.Min(totalPages, maxPagesToCheck)}");
+                }
+
+                var videoNodes = FindVideoNodes(doc);
+                if (videoNodes == null || videoNodes.Count == 0)
+                {
+                    Console.WriteLine($"No videos found on page {currentPage}.");
+                    currentPage++;
+                    continue;
+                }
+
+                Console.WriteLine($"Found {videoNodes.Count} videos on page {currentPage}.");
+
+                foreach (var node in videoNodes)
+                {
+                    if (allVideos.Count >= maxVideos)
+                        break;
+
+                    try
+                    {
+                        var title = ExtractTitle(node);
+                        var postUrl = ExtractUrl(node);
+
+                        if (string.IsNullOrEmpty(postUrl) || !postUrl.Contains("/post/"))
+                        {
+                            continue;
+                        }
+
+                        if (!postUrl.StartsWith("http"))
+                        {
+                            postUrl = postUrl.StartsWith("/") ? BaseUrl + postUrl : BaseUrl + "/" + postUrl;
+                        }
+
+                        var postId = ExtractPostIdFromUrl(postUrl);
+
+                        allVideos.Add(new VideoData
+                        {
+                            Title = title,
+                            Url = postUrl,
+                            PostId = postId
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error processing a video node: {ex.Message}");
+                    }
+                }
+
+                currentPage++;
+                
+                // If this is not the last page, add a small delay before fetching the next page
+                if (currentPage <= Math.Min(totalPages, maxPagesToCheck) && allVideos.Count < maxVideos)
+                {
+                    await Task.Delay(1500);
+                }
             }
 
-            // Process all nodes in the same way as ScrapeChannel
-            Console.WriteLine($"Found {videoNodes.Count} videos on channel page. Processing...");
-
-            foreach (var node in videoNodes)
-            {
-                // Break when we've reached the desired number of videos
-                if (videos.Count >= maxVideos)
-                    break;
-
-                try
-                {
-                    var title = ExtractTitle(node);
-                    var postUrl = ExtractUrl(node);
-
-                    if (string.IsNullOrEmpty(postUrl) || !postUrl.Contains("/post/"))
-                    {
-                        continue;
-                    }
-
-                    if (!postUrl.StartsWith("http"))
-                    {
-                        postUrl = postUrl.StartsWith("/") ? BaseUrl + postUrl : BaseUrl + "/" + postUrl;
-                    }
-
-                    var postId = ExtractPostIdFromUrl(postUrl);
-
-                    videos.Add(new VideoData
-                    {
-                        Title = title,
-                        Url = postUrl,
-                        PostId = postId
-                    });
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error processing a video node: {ex.Message}");
-                }
-            }
-
-            return videos;
+            return allVideos;
         }
 
         private string NormalizeChannelUrl(string channelInput)
@@ -538,6 +602,63 @@ namespace SimpleScraper
                 return match.Groups[1].Value;
             }
             return string.Empty;
+        }
+
+        private int ExtractTotalPages(HtmlDocument doc, string baseUrl)
+        {
+            try
+            {
+                // Look for pagination controls
+                var paginationDiv = doc.DocumentNode.SelectSingleNode("//div[@id='center_control']");
+                if (paginationDiv == null)
+                {
+                    Console.WriteLine("No pagination controls found. Assuming only 1 page.");
+                    return 1;
+                }
+
+                // Find all pagination links
+                var paginationLinks = paginationDiv.SelectNodes(".//a[@href]");
+                if (paginationLinks == null || paginationLinks.Count == 0)
+                {
+                    return 1;
+                }
+
+                // Extract page offsets and find the total number of pages
+                int maxOffset = 0;
+                int itemsPerPage = 30; // Default items per page is 30
+
+                foreach (var link in paginationLinks)
+                {
+                    string href = link.GetAttributeValue("href", "");
+                    var match = Regex.Match(href, @"page=(\d+)");
+                    if (match.Success && int.TryParse(match.Groups[1].Value, out int offset))
+                    {
+                        maxOffset = Math.Max(maxOffset, offset);
+                    }
+                }
+
+                // If we found the maximum offset, calculate the total pages
+                // Adding 1 to include the first page (which has offset 0)
+                int totalPages = (maxOffset / itemsPerPage) + 1;
+                Console.WriteLine($"Found pagination with max offset {maxOffset}, calculating {totalPages} total pages");
+                return totalPages;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error extracting total pages: {ex.Message}");
+                return 1; // Default to 1 page on error
+            }
+        }
+
+        private string GetBaseUrlWithoutPage(string url)
+        {
+            // Remove any existing ?page= parameter
+            int queryIndex = url.IndexOf("?page=");
+            if (queryIndex > 0)
+            {
+                return url.Substring(0, queryIndex);
+            }
+            return url;
         }
 
         public void Dispose()
