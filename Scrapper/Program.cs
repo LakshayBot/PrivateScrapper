@@ -12,6 +12,15 @@ namespace SimpleScraper
         {
             try
             {
+                // Check if automated mode is requested via command line
+                bool automatedMode = args.Length > 0 && (args[0] == "--auto" || args[0] == "-a");
+
+                if (automatedMode)
+                {
+                    await RunAutomatedMode();
+                    return;
+                }
+
                 Console.WriteLine("Simple Video URL Scraper");
                 Console.WriteLine("------------------------");
 
@@ -21,42 +30,98 @@ namespace SimpleScraper
                 // Initialize database
                 var dbService = new DatabaseService(connectionString);
                 Console.WriteLine("Initializing database...");
-                //await dbService.InitializeDatabaseAsync();
+                await dbService.InitializeDatabaseAsync();
 
                 Console.WriteLine("\nSelect an operation mode:");
                 Console.WriteLine("1. One-time scraping");
                 Console.WriteLine("2. Monitor channels from database");
                 Console.WriteLine("3. Add new channel to database");
+                Console.WriteLine("4. Download all undownloaded videos");
+                Console.WriteLine("5. Start automated processing");
                 Console.Write("Enter option (default: 1): ");
                 
                 string option = Console.ReadLine();
                 
-                var scraper = new VideoScraper();
-                Console.WriteLine("Initializing browser...");
-                await scraper.Initialize();
-
                 switch (option)
                 {
                     case "2": // Monitor channels from database
+                        var scraper = new VideoScraper();
+                        Console.WriteLine("Initializing browser...");
+                        await scraper.Initialize();
                         await MonitorChannelsFromDatabase(scraper, dbService);
+                        scraper.Dispose();
                         break;
                         
                     case "3": // Add new channel
                         await AddChannelToDatabase(dbService);
                         break;
                         
+                    case "4": // Download all undownloaded videos
+                        await DownloadAllUndownloadedVideos(dbService);
+                        break;
+                        
+                    case "5": // Start automated processing
+                        await RunAutomatedMode();
+                        break;
+                        
                     default: // One-time scraping (option 1 or invalid)
-                        await PerformOneTimeScraping(scraper, dbService);
+                        var oneTimeScraper = new VideoScraper();
+                        Console.WriteLine("Initializing browser...");
+                        await oneTimeScraper.Initialize();
+                        await PerformOneTimeScraping(oneTimeScraper, dbService);
+                        oneTimeScraper.Dispose();
                         break;
                 }
-
-                scraper.Dispose();
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"An error occurred: {ex.Message}");
                 Console.WriteLine(ex.StackTrace);
             }
+        }
+
+        static async Task RunAutomatedMode()
+        {
+            Console.WriteLine("Starting in automated mode...");
+            
+            // Hardcoded connection string for automated mode
+            string connectionString = "Host=192.168.1.3;Database=scraper;Username=postgres;Password=postgres";
+            
+            // Default download directory
+            string downloadDir = Path.Combine(Directory.GetCurrentDirectory(), "downloads");
+            
+            // Initialize logger
+            Logger.Initialize(Path.Combine(downloadDir, "logs"));
+            Logger.Log($"Automated mode starting at {DateTime.Now}");
+            Logger.Log($"Download directory: {downloadDir}");
+            
+            // Create and start the automated service
+            using var automatedService = new AutomatedScraperService(connectionString, downloadDir);
+            
+            await automatedService.Initialize();
+            
+            Logger.Log("\nAutomated processing started");
+            Logger.Log("Press Ctrl+C to stop.");
+            
+            // Set up console cancellation
+            var exitEvent = new ManualResetEvent(false);
+            Console.CancelKeyPress += (sender, e) => {
+                e.Cancel = true;
+                exitEvent.Set();
+                Logger.Log("Shutdown requested by user. Stopping services...");
+                automatedService.StopAutomatedProcessing();
+            };
+
+            // Start the automated processing
+            var processingTask = automatedService.StartAutomatedProcessing();
+            
+            // Wait for Ctrl+C
+            exitEvent.WaitOne();
+            
+            // Wait for processing to stop gracefully
+            await processingTask;
+            Logger.Log("Automated processing stopped. Exiting...");
+            Logger.Close();
         }
 
         static async Task MonitorChannelsFromDatabase(VideoScraper scraper, DatabaseService dbService)
@@ -146,6 +211,17 @@ namespace SimpleScraper
             Console.WriteLine($"Channel '{channelName}' added successfully with URL: {channelUrl}");
         }
 
+        static async Task DownloadAllUndownloadedVideos(DatabaseService dbService)
+        {
+            Console.Write("\nEnter download directory (leave empty for default): ");
+            string downloadDir = Console.ReadLine();
+            
+            var downloader = new VideoDownloader(dbService, 
+                string.IsNullOrWhiteSpace(downloadDir) ? null : downloadDir);
+            
+            await downloader.DownloadAllUndownloadedVideosAsync();
+        }
+
         // Extracted method to normalize channel input to a URL
         static string NormalizeChannelInput(string channelInput)
         {
@@ -211,6 +287,24 @@ namespace SimpleScraper
             Console.WriteLine("\nSaving videos to PostgreSQL database...");
             await dbService.SaveVideosAsync(videos);
             Console.WriteLine($"Successfully saved {videos.Count} videos to database.");
+            
+            // Ask user if they want to download the videos now
+            Console.Write("\nDo you want to download these videos now? (Y/N): ");
+            string downloadNow = Console.ReadLine();
+            
+            if (downloadNow?.Trim().ToUpper() == "Y")
+            {
+                Console.Write("Enter download directory (leave empty for default): ");
+                string downloadDir = Console.ReadLine();
+                
+                var downloader = new VideoDownloader(dbService, 
+                    string.IsNullOrWhiteSpace(downloadDir) ? null : downloadDir);
+                
+                foreach (var video in videos)
+                {
+                    await downloader.DownloadVideoAsync(video);
+                }
+            }
         }
 
         static string GetConnectionString()
@@ -221,7 +315,7 @@ namespace SimpleScraper
             Console.WriteLine("--------------------------------");
             Console.Write($"Connection String (default: {defaultConnectionString}): ");
 
-            string input = Console.ReadLine();
+            string input = defaultConnectionString;
             return string.IsNullOrWhiteSpace(input) ? defaultConnectionString : input;
         }
     }
