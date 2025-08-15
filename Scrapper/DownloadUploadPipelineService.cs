@@ -187,6 +187,11 @@ namespace SimpleScraper
                         
                         await _downloader.DownloadVideoAsync(video, false, (downloadProgress) => {
                             progress.Status = $"Downloading... {downloadProgress:F1}%";
+                            // Update downloaded bytes based on progress and total file size
+                            if (progress.TotalBytes.HasValue)
+                            {
+                                progress.DownloadedBytes = (long)(progress.TotalBytes.Value * downloadProgress / 100.0);
+                            }
                         }, (fileSize) => {
                             progress.TotalBytes = fileSize;
                         }); // Silent download for pipeline with progress callback
@@ -275,11 +280,8 @@ namespace SimpleScraper
             {
                 try
                 {
-                    lock (_statusLock)
-                    {
-                        // Display organized status with smart console clearing
-                        DisplayPipelineStatus();
-                    }
+                    // Display organized status with smart console clearing
+                    await DisplayPipelineStatus();
                     
                     await Task.Delay(2000, cancellationToken); // Update every 2 seconds
                 }
@@ -287,7 +289,7 @@ namespace SimpleScraper
                 {
                     break;
                 }
-                catch (Exception ex)
+                catch (Exception)
                 {
                     // Don't log display errors to avoid cluttering
                     // Logger.Log($"Status display error: {ex.Message}");
@@ -303,14 +305,30 @@ namespace SimpleScraper
             }
         }
 
-        private void DisplayPipelineStatus()
+        private async Task DisplayPipelineStatus()
         {
             // Build the dashboard content without clearing the console
             var sb = new StringBuilder();
             
-            // Calculate overall progress
-            var totalVideos = _completedDownloads.Count + _completedUploads.Count + _downloadQueue.Count + _uploadQueue.Count + _downloadProgress.Count + _uploadProgress.Count;
-            var completedVideos = _completedUploads.Count;
+            // Calculate overall progress using database counts for accuracy
+            int pendingDownloadsCount = 0;
+            int pendingUploadsCount = 0;
+            int totalCompletedUploads = _completedUploads.Count;
+            
+            try
+            {
+                pendingDownloadsCount = await _dbService.GetUndownloadedVideosCountAsync();
+                pendingUploadsCount = await _dbService.GetPendingUploadsCountAsync();
+            }
+            catch (Exception)
+            {
+                // Fallback to memory counts if database is unavailable
+                pendingDownloadsCount = _downloadQueue.Count;
+                pendingUploadsCount = _uploadQueue.Count;
+            }
+            
+            var totalVideos = totalCompletedUploads + pendingDownloadsCount + pendingUploadsCount + _downloadProgress.Count + _uploadProgress.Count;
+            var completedVideos = totalCompletedUploads;
             var overallProgress = totalVideos > 0 ? (double)completedVideos / totalVideos * 100 : 0;
             
             // Calculate time estimates
@@ -343,8 +361,40 @@ namespace SimpleScraper
             sb.AppendLine("╠═══════════════════════════════════════════════════════════════════════════════╣");
             sb.AppendLine("║");
             
+            // Channel Monitoring Section
+            try
+            {
+                var activeChannels = await _dbService.GetActiveChannelsAsync();
+                var channelStats = await _dbService.GetChannelStatsAsync();
+                
+                sb.AppendLine("║ 📡 CHANNEL MONITORING:");
+                if (activeChannels.Any())
+                {
+                    foreach (var channel in activeChannels.Take(5))
+                    {
+                        var stats = channelStats.ContainsKey(channel.Id) ? channelStats[channel.Id] : null;
+                        var channelName = TruncateString(channel.Name ?? "Unknown", 25);
+                        var lastChecked = channel.LastChecked?.ToString("MM/dd HH:mm") ?? "Never";
+                        var videoStats = stats != null ? $"P:{stats.PendingDownloads} U:{stats.PendingUploads} C:{stats.Completed}" : "0/0/0";
+                        
+                        sb.AppendLine($"║   🎯 {channelName} | Last: {lastChecked} | {videoStats}");
+                    }
+                }
+                else
+                {
+                    sb.AppendLine("║   No active channels configured");
+                }
+                sb.AppendLine("║");
+            }
+            catch (Exception ex)
+            {
+                sb.AppendLine("║ 📡 CHANNEL MONITORING:");
+                sb.AppendLine($"║   Error loading channel data: {TruncateString(ex.Message, 60)}");
+                sb.AppendLine("║");
+            }
+            
             // Overall Progress Bar
-            sb.AppendLine("║ � OVERALL PROGRESS:");
+            sb.AppendLine("║ 📊 OVERALL PROGRESS:");
             sb.AppendLine($"║   {CreateProgressBar(overallProgress, 60)} {overallProgress:F1}%");
             sb.AppendLine($"║   Completed: {completedVideos}/{totalVideos} videos | Elapsed: {elapsed:hh\\:mm\\:ss} | ETA: {remaining:hh\\:mm\\:ss}");
             
@@ -369,8 +419,9 @@ namespace SimpleScraper
                     var elapsed_item = DateTime.Now - progress.StartTime;
                     var workerInfo = $"Worker {progress.WorkerId}";
                     var sizeInfo = progress.TotalBytes.HasValue ? $" | {progress.FileSizeText}" : "";
+                    var speedInfo = $" | {progress.DownloadSpeedText}";
                     sb.AppendLine($"║   📥 {title}");
-                    sb.AppendLine($"║      {progress.Status} | {workerInfo} | {elapsed_item:mm\\:ss}{sizeInfo}");
+                    sb.AppendLine($"║      {progress.Status} | {workerInfo} | {elapsed_item:mm\\:ss}{sizeInfo}{speedInfo}");
                 }
                 
                 // Show active uploads
@@ -393,12 +444,12 @@ namespace SimpleScraper
             }
             
             // Pipeline Status Bar
-            sb.AppendLine("║ � PIPELINE STATUS:");
+            sb.AppendLine("║ 📊 PIPELINE STATUS:");
             sb.AppendLine("║   ┌─────────────────┬─────────┬─────────┬───────────┬─────────┐");
-            sb.AppendLine("║   │ Stage           │ Active  │ Queued  │ Completed │ Workers │");
+            sb.AppendLine("║   │ Stage           │ Active  │ Pending │ Completed │ Workers │");
             sb.AppendLine("║   ├─────────────────┼─────────┼─────────┼───────────┼─────────┤");
-            sb.AppendLine($"║   │ Downloads       │ {activeDownloads.Count,7} │ {_downloadQueue.Count,7} │ {_completedDownloads.Count,9} │ {activeDownloads.Count}/{_maxConcurrentDownloads,7} │");
-            sb.AppendLine($"║   │ Uploads         │ {activeUploads.Count,7} │ {_uploadQueue.Count,7} │ {_completedUploads.Count,9} │ {activeUploads.Count}/{_maxConcurrentUploads,7} │");
+            sb.AppendLine($"║   │ Downloads       │ {activeDownloads.Count,7} │ {pendingDownloadsCount,7} │ {_completedDownloads.Count,9} │ {activeDownloads.Count}/{_maxConcurrentDownloads,7} │");
+            sb.AppendLine($"║   │ Uploads         │ {activeUploads.Count,7} │ {pendingUploadsCount,7} │ {_completedUploads.Count,9} │ {activeUploads.Count}/{_maxConcurrentUploads,7} │");
             sb.AppendLine("║   └─────────────────┴─────────┴─────────┴───────────┴─────────┘");
             
             sb.AppendLine("╚═══════════════════════════════════════════════════════════════════════════════╝");
@@ -460,7 +511,9 @@ namespace SimpleScraper
         public DateTime? EndTime { get; set; }
         public long? TotalBytes { get; set; }
         public long DownloadedBytes { get; set; }
+        public DateTime LastSpeedUpdate { get; set; } = DateTime.Now;
         public string FileSizeText => TotalBytes.HasValue ? FormatFileSize(TotalBytes.Value) : "Unknown size";
+        public string DownloadSpeedText => GetDownloadSpeed();
         
         private string FormatFileSize(long bytes)
         {
@@ -468,6 +521,18 @@ namespace SimpleScraper
             if (bytes < 1024 * 1024) return $"{bytes / 1024.0:F1} KB";
             if (bytes < 1024 * 1024 * 1024) return $"{bytes / (1024.0 * 1024):F1} MB";
             return $"{bytes / (1024.0 * 1024 * 1024):F1} GB";
+        }
+        
+        private string GetDownloadSpeed()
+        {
+            var elapsed = DateTime.Now - StartTime;
+            if (elapsed.TotalSeconds < 1 || DownloadedBytes == 0) return "Calculating...";
+            
+            var bytesPerSecond = DownloadedBytes / elapsed.TotalSeconds;
+            if (bytesPerSecond < 1024) return $"{bytesPerSecond:F0} B/s";
+            if (bytesPerSecond < 1024 * 1024) return $"{bytesPerSecond / 1024:F1} KB/s";
+            if (bytesPerSecond < 1024 * 1024 * 1024) return $"{bytesPerSecond / (1024 * 1024):F1} MB/s";
+            return $"{bytesPerSecond / (1024 * 1024 * 1024):F2} GB/s";
         }
     }
 

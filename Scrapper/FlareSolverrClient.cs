@@ -43,7 +43,7 @@ namespace SimpleScraper
             _random = new Random();
         }
 
-        private string GetNextUserAgent()
+        private string GetNextUserAgent(Action<string>? statusCallback = null)
         {
             // Use round-robin with some randomness
             _currentUserAgentIndex = (_currentUserAgentIndex + 1) % _userAgents.Count;
@@ -55,22 +55,22 @@ namespace SimpleScraper
             }
             
             var userAgent = _userAgents[_currentUserAgentIndex];
-            Console.WriteLine($"🔄 Using User Agent: {userAgent.Substring(0, Math.Min(50, userAgent.Length))}...");
+            statusCallback?.Invoke($"🔄 Using User Agent: {userAgent.Substring(0, Math.Min(50, userAgent.Length))}...");
             return userAgent;
         }
 
-        private async Task RecreateSessionWithNewUserAgent()
+        private async Task RecreateSessionWithNewUserAgent(Action<string>? statusCallback = null)
         {
-            Console.WriteLine("🚫 Possible ban detected - recreating session with new user agent...");
+            statusCallback?.Invoke("🚫 Possible ban detected - recreating session with new user agent...");
             
             // Destroy current session
-            await DestroySessionAsync();
+            await DestroySessionAsync(statusCallback);
             
             // Wait a bit before creating new session
             await Task.Delay(2000);
             
             // Create new session (will use new user agent)
-            await CreateSessionAsync();
+            await CreateSessionAsync(statusCallback);
         }
 
         public async Task<bool> TestConnectionAsync()
@@ -91,9 +91,9 @@ namespace SimpleScraper
             }
         }
 
-        public async Task CreateSessionAsync()
+        public async Task CreateSessionAsync(Action<string>? statusCallback = null)
         {
-            var userAgent = GetNextUserAgent();
+            var userAgent = GetNextUserAgent(statusCallback);
             
             var requestData = new
             {
@@ -105,7 +105,7 @@ namespace SimpleScraper
             if (response.Status == "ok")
             {
                 _sessionId = response.Session;
-                Console.WriteLine($"✅ FlareSolverr session created: {_sessionId}");
+                statusCallback?.Invoke($"✅ FlareSolverr session created: {_sessionId}");
             }
             else
             {
@@ -113,14 +113,14 @@ namespace SimpleScraper
             }
         }
 
-        public async Task<string> GetPageContentAsync(string url)
+        public async Task<string> GetPageContentAsync(string url, Action<string>? statusCallback = null)
         {
             if (string.IsNullOrEmpty(_sessionId))
             {
-                await CreateSessionAsync();
+                await CreateSessionAsync(statusCallback);
             }
 
-            var currentUserAgent = GetNextUserAgent();
+            var currentUserAgent = GetNextUserAgent(statusCallback);
             var requestData = new
             {
                 cmd = "request.get",
@@ -130,12 +130,12 @@ namespace SimpleScraper
                 maxTimeout = 120000 // 2 minutes in milliseconds
             };
 
-            Console.WriteLine($"Requesting page via FlareSolverr: {url}");
+            statusCallback?.Invoke($"📡 Requesting page via FlareSolverr: {url}");
             var response = await SendRequestAsync(requestData);
 
             if (response.Status == "ok")
             {
-                Console.WriteLine($"✅ Successfully retrieved page content (length: {response.Solution?.Response?.Length ?? 0})");
+                statusCallback?.Invoke($"✅ Successfully retrieved page content (length: {response.Solution?.Response?.Length ?? 0})");
                 return response.Solution?.Response ?? "";
             }
 
@@ -144,13 +144,13 @@ namespace SimpleScraper
             if (message.Contains("session") || message.Contains("ban") || message.Contains("block") || 
                 message.Contains("403") || message.Contains("captcha") || message.Contains("challenge"))
             {
-                Console.WriteLine($"🚫 Possible ban/block detected: {response.Message}");
+                statusCallback?.Invoke($"🚫 Possible ban/block detected: {response.Message}");
                 
                 // Try recreating session with new user agent
-                await RecreateSessionWithNewUserAgent();
+                await RecreateSessionWithNewUserAgent(statusCallback);
                 
                 // Retry with new session and user agent
-                currentUserAgent = GetNextUserAgent();
+                currentUserAgent = GetNextUserAgent(statusCallback);
                 requestData = new
                 {
                     cmd = "request.get",
@@ -163,7 +163,7 @@ namespace SimpleScraper
                 response = await SendRequestAsync(requestData);
                 if (response.Status == "ok")
                 {
-                    Console.WriteLine($"✅ Retry successful with new session");
+                    statusCallback?.Invoke($"✅ Retry successful with new session");
                     return response.Solution?.Response ?? "";
                 }
             }
@@ -171,68 +171,68 @@ namespace SimpleScraper
             throw new Exception($"FlareSolverr request failed: {response.Message}");
         }
 
-        public async Task<string> GetVideoUrlFromPage(string url, string postId)
+        public async Task<string?> GetVideoUrlFromPage(string url, string postId, Action<string>? statusCallback = null)
         {
             if (string.IsNullOrEmpty(_sessionId))
             {
-                await CreateSessionAsync();
+                await CreateSessionAsync(statusCallback);
             }
 
-            Console.WriteLine($"Getting video URL for: {url}");
+            statusCallback?.Invoke($"🔍 Getting video URL for: {postId}");
             
             try
             {
                 // Step 1: Get session cookies from FlareSolverr (to bypass Cloudflare)
-                Console.WriteLine("Step 1: Getting session cookies from FlareSolverr...");
-                var sessionInfo = await GetSessionCookies(url);
+                statusCallback?.Invoke("🍪 Getting session cookies from FlareSolverr...");
+                var sessionInfo = await GetSessionCookies(url, statusCallback);
                 
                 if (sessionInfo == null || sessionInfo.Cookies == null || sessionInfo.Cookies.Count == 0)
                 {
-                    Console.WriteLine("❌ Failed to get session cookies from FlareSolverr, trying with new session...");
+                    statusCallback?.Invoke("⚠️ Failed to get session cookies, trying with new session...");
                     
                     // Try recreating session
-                    await RecreateSessionWithNewUserAgent();
-                    sessionInfo = await GetSessionCookies(url);
+                    await RecreateSessionWithNewUserAgent(statusCallback);
+                    sessionInfo = await GetSessionCookies(url, statusCallback);
                     
                     if (sessionInfo == null || sessionInfo.Cookies == null || sessionInfo.Cookies.Count == 0)
                     {
-                        Console.WriteLine("❌ Still failed to get session cookies after retry");
+                        statusCallback?.Invoke("❌ Still failed to get session cookies after retry");
                         return null;
                     }
                 }
                 
-                Console.WriteLine($"✅ Got {sessionInfo.Cookies.Count} cookies from FlareSolverr");
+                statusCallback?.Invoke($"✅ Got {sessionInfo.Cookies.Count} cookies from FlareSolverr");
                 
                 // Step 2: Use Puppeteer with FlareSolverr cookies to interact with the page
-                Console.WriteLine("Step 2: Using Puppeteer to click video element and capture network requests...");
-                var vidUrl = await CaptureVideoUrlWithPuppeteer(url, postId, sessionInfo.Cookies, sessionInfo.UserAgent);
+                statusCallback?.Invoke("🎭 Using Puppeteer to click video element and capture network requests...");
+                var vidUrl = await CaptureVideoUrlWithPuppeteer(url, postId, sessionInfo.Cookies, sessionInfo.UserAgent, statusCallback);
                 
                 if (!string.IsNullOrEmpty(vidUrl))
                 {
-                    Console.WriteLine($"✅ Found .vid URL: {vidUrl}");
+                    statusCallback?.Invoke($"✅ Found .vid URL!");
                     
                     // Step 3: Follow redirects to get final trafficdeposit.com URL
-                    Console.WriteLine("Step 3: Following redirects to get final URL...");
-                    var finalUrl = await FollowRedirectsToFinalUrl(vidUrl);
+                    statusCallback?.Invoke("🔗 Following redirects to get final URL...");
+                    var finalUrl = await FollowRedirectsToFinalUrl(vidUrl, statusCallback);
                     
                     if (!string.IsNullOrEmpty(finalUrl))
                     {
-                        Console.WriteLine($"✅ Final video URL: {finalUrl}");
+                        statusCallback?.Invoke($"✅ Final video URL obtained!");
                         return finalUrl;
                     }
                 }
                 
-                Console.WriteLine($"❌ No .vid URL found for post {postId}");
+                statusCallback?.Invoke($"❌ No .vid URL found for post {postId}");
                 return null;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error getting video URL: {ex.Message}");
+                statusCallback?.Invoke($"❌ Error getting video URL: {ex.Message}");
                 return null;
             }
         }
         
-        private async Task<string> FollowRedirectsToFinalUrl(string url)
+        private async Task<string?> FollowRedirectsToFinalUrl(string url, Action<string>? statusCallback = null)
         {
             if (string.IsNullOrEmpty(url))
                 return null;
@@ -252,7 +252,7 @@ namespace SimpleScraper
                     var finalUrl = response.RequestMessage?.RequestUri?.ToString() ?? url;
                     if (finalUrl.Contains("trafficdeposit.com"))
                     {
-                        Console.WriteLine($"✅ Successfully followed redirects: {url} -> {finalUrl}");
+                        statusCallback?.Invoke($"✅ Successfully followed redirects!");
                         return finalUrl;
                     }
                 }
@@ -261,7 +261,7 @@ namespace SimpleScraper
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error following redirects for {url}: {ex.Message}");
+                statusCallback?.Invoke($"⚠️ Error following redirects: {ex.Message.Substring(0, Math.Min(30, ex.Message.Length))}...");
                 return url; // Return original URL if redirect fails
             }
         }
@@ -283,7 +283,7 @@ namespace SimpleScraper
             return response ?? new FlareSolverrResponse { Status = "error", Message = "Failed to parse response" };
         }
 
-        public async Task DestroySessionAsync()
+        public async Task DestroySessionAsync(Action<string>? statusCallback = null)
         {
             if (string.IsNullOrEmpty(_sessionId)) return;
 
@@ -296,11 +296,11 @@ namespace SimpleScraper
                 };
 
                 await SendRequestAsync(requestData);
-                Console.WriteLine($"FlareSolverr session destroyed: {_sessionId}");
+                statusCallback?.Invoke($"🗑️ FlareSolverr session destroyed: {_sessionId}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error destroying session: {ex.Message}");
+                statusCallback?.Invoke($"❌ Error destroying session: {ex.Message}");
             }
             finally
             {
@@ -308,11 +308,11 @@ namespace SimpleScraper
             }
         }
 
-        private async Task<SessionInfo> GetSessionCookies(string url)
+        private async Task<SessionInfo> GetSessionCookies(string url, Action<string>? statusCallback = null)
         {
             try
             {
-                var currentUserAgent = GetNextUserAgent();
+                var currentUserAgent = GetNextUserAgent(statusCallback);
                 
                 // Make a request to get the page and cookies
                 var requestData = new
@@ -344,16 +344,16 @@ namespace SimpleScraper
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error getting session cookies: {ex.Message}");
+                statusCallback?.Invoke($"❌ Error getting session cookies: {ex.Message}");
                 return null;
             }
         }
 
-        private async Task<string> CaptureVideoUrlWithPuppeteer(string url, string postId, List<FlareSolverrCookie> cookies, string userAgent)
+        private async Task<string?> CaptureVideoUrlWithPuppeteer(string url, string postId, List<FlareSolverrCookie> cookies, string userAgent, Action<string>? statusCallback = null)
         {
             try
             {
-                Console.WriteLine("Launching Puppeteer with FlareSolverr session cookies...");
+                statusCallback?.Invoke("🚀 Launching Puppeteer with FlareSolverr session cookies...");
 
                 var browserFetcher = new BrowserFetcher();
                 await browserFetcher.DownloadAsync();
@@ -413,32 +413,32 @@ namespace SimpleScraper
                     // Look for .vid URLs
                     if (requestUrl.Contains(".vid") && requestUrl.Contains(postId))
                     {
-                        Console.WriteLine($"🎯 Found .vid URL in network requests: {requestUrl}");
+                        statusCallback?.Invoke($"🎯 Found .vid URL in network requests: {requestUrl}");
                         vidUrl = requestUrl;
                         videoUrlTaskCompletion.TrySetResult(requestUrl);
                     }
                     else if (requestUrl.Contains(".vid") && requestUrl.Contains("trafficdeposit"))
                     {
-                        Console.WriteLine($"🎯 Found trafficdeposit .vid URL: {requestUrl}");
+                        statusCallback?.Invoke($"🎯 Found trafficdeposit .vid URL: {requestUrl}");
                         vidUrl = requestUrl;
                         videoUrlTaskCompletion.TrySetResult(requestUrl);
                     }
                 };
 
-                Console.WriteLine($"Navigating to: {url}");
+                statusCallback?.Invoke($"🌐 Navigating to: {postId}");
                 await page.GoToAsync(url, new NavigationOptions { WaitUntil = new[] { WaitUntilNavigation.Networkidle2 } });
 
                 // Wait for page to load completely
                 await Task.Delay(3000);
 
                 // Look for the video player element and click it
-                Console.WriteLine("Looking for video player element...");
+                statusCallback?.Invoke("🎬 Looking for video player element...");
                 
                 try
                 {
                     // Try to find and click the video player element
                     await page.WaitForSelectorAsync("#player_el", new WaitForSelectorOptions { Timeout = 5000 });
-                    Console.WriteLine("Found #player_el, clicking...");
+                    statusCallback?.Invoke("🎬 Found #player_el, clicking...");
                     await page.ClickAsync("#player_el");
                 }
                 catch
@@ -451,7 +451,7 @@ namespace SimpleScraper
                         try
                         {
                             await page.WaitForSelectorAsync(selector, new WaitForSelectorOptions { Timeout = 2000 });
-                            Console.WriteLine($"Found {selector}, clicking...");
+                            statusCallback?.Invoke($"🎬 Found {selector}, clicking...");
                             await page.ClickAsync(selector);
                             break;
                         }
@@ -477,7 +477,7 @@ namespace SimpleScraper
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error in Puppeteer video capture: {ex.Message}");
+                statusCallback?.Invoke($"❌ Error in Puppeteer video capture: {ex.Message}");
                 return null;
             }
         }

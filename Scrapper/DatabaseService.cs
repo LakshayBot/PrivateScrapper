@@ -136,13 +136,47 @@ namespace SimpleScraper
             return videos;
         }
 
+        public async Task<int> GetUndownloadedVideosCountAsync()
+        {
+            using var connection = new NpgsqlConnection(_connectionString);
+            await connection.OpenAsync();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                SELECT COUNT(*) 
+                FROM videos 
+                WHERE (downloaded = FALSE OR downloaded IS NULL) 
+                  AND video_source_url IS NOT NULL;
+            ";
+
+            var result = await command.ExecuteScalarAsync();
+            return Convert.ToInt32(result);
+        }
+
+        public async Task<int> GetPendingUploadsCountAsync()
+        {
+            using var connection = new NpgsqlConnection(_connectionString);
+            await connection.OpenAsync();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                SELECT COUNT(*) 
+                FROM videos 
+                WHERE downloaded = TRUE 
+                  AND (is_uploaded_to_telegram = FALSE OR is_uploaded_to_telegram IS NULL);
+            ";
+
+            var result = await command.ExecuteScalarAsync();
+            return Convert.ToInt32(result);
+        }
+
         public async Task<List<ChannelData>> GetActiveChannelsAsync()
         {
             using var connection = new NpgsqlConnection(_connectionString);
             await connection.OpenAsync();
 
             using var command = connection.CreateCommand();
-            command.CommandText = "SELECT id, name, url, check_interval_minutes FROM channels WHERE is_active = TRUE;";
+            command.CommandText = "SELECT id, name, url, check_interval_minutes, last_checked FROM channels WHERE is_active = TRUE;";
 
             using var reader = await command.ExecuteReaderAsync();
             var channels = new List<ChannelData>();
@@ -154,7 +188,8 @@ namespace SimpleScraper
                     Id = reader.GetInt32(0),
                     Name = reader.GetString(1),
                     Url = reader.GetString(2),
-                    CheckIntervalMinutes = reader.GetInt32(3)
+                    CheckIntervalMinutes = reader.GetInt32(3),
+                    LastChecked = reader.IsDBNull(4) ? null : reader.GetDateTime(4)
                 });
             }
 
@@ -190,6 +225,46 @@ namespace SimpleScraper
             command.Parameters.AddWithValue("checkInterval", checkIntervalMinutes);
 
             await command.ExecuteNonQueryAsync();
+        }
+
+        public async Task<Dictionary<int, ChannelStats>> GetChannelStatsAsync()
+        {
+            using var connection = new NpgsqlConnection(_connectionString);
+            await connection.OpenAsync();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                SELECT 
+                    c.id,
+                    c.name,
+                    COUNT(CASE WHEN v.downloaded = FALSE OR v.downloaded IS NULL THEN 1 END) as pending_downloads,
+                    COUNT(CASE WHEN v.downloaded = TRUE AND (v.is_uploaded_to_telegram = FALSE OR v.is_uploaded_to_telegram IS NULL) THEN 1 END) as pending_uploads,
+                    COUNT(CASE WHEN v.is_uploaded_to_telegram = TRUE THEN 1 END) as completed,
+                    COUNT(v.id) as total_videos
+                FROM channels c
+                LEFT JOIN videos v ON v.url LIKE '%' || REPLACE(REPLACE(c.url, 'https://sxyprn.com/', ''), '.html', '') || '%'
+                WHERE c.is_active = TRUE
+                GROUP BY c.id, c.name
+            ";
+
+            using var reader = await command.ExecuteReaderAsync();
+            var stats = new Dictionary<int, ChannelStats>();
+
+            while (await reader.ReadAsync())
+            {
+                var channelId = reader.GetInt32(0);
+                stats[channelId] = new ChannelStats
+                {
+                    ChannelId = channelId,
+                    ChannelName = reader.GetString(1),
+                    PendingDownloads = reader.GetInt32(2),
+                    PendingUploads = reader.GetInt32(3),
+                    Completed = reader.GetInt32(4),
+                    TotalVideos = reader.GetInt32(5)
+                };
+            }
+
+            return stats;
         }
 
         public async Task MarkVideoAsDownloadedAsync(string url, string downloadPath)

@@ -290,19 +290,18 @@ namespace SimpleScraper
                     
                     if (string.IsNullOrEmpty(video.VideoSourceUrl))
                     {
-                        pipelineService.UpdateScrapeStatus($"🔗 Getting download URL for video {processedCount}/{videos.Count}: {video.Title}");
                         try
                         {
-                            string vidUrl = await videoScraper.GetVideoSourceUrl(video.Url);
+                            string? vidUrl = await videoScraper.GetVideoSourceUrl(video.Url, pipelineService.UpdateScrapeStatus);
                             if (!string.IsNullOrEmpty(vidUrl))
                             {
                                 video.VideoSourceUrl = vidUrl;
                                 await dbService.UpdateVideoSourceUrlAsync(video.Url, vidUrl);
-                                Console.WriteLine($"✅ Got source URL for: {video.Title}");
+                                pipelineService.UpdateScrapeStatus($"✅ Got source URL for: {video.Title}");
                             }
                             else
                             {
-                                Console.WriteLine($"⚠️ Could not get source URL for: {video.Title}");
+                                pipelineService.UpdateScrapeStatus($"⚠️ Could not get source URL for: {video.Title}");
                             }
                         }
                         catch (Exception ex)
@@ -538,7 +537,7 @@ namespace SimpleScraper
                                 PostId = postId
                             };
 
-                            string vidUrl = await GetVideoSourceUrl(postUrl);
+                            string? vidUrl = await GetVideoSourceUrl(postUrl);
                             if (!string.IsNullOrEmpty(vidUrl))
                             {
                                 video.VideoSourceUrl = vidUrl;
@@ -574,7 +573,7 @@ namespace SimpleScraper
             return allVideos;
         }
 
-        public async Task<List<VideoData>> MonitorChannel(string channelInput, int maxVideosToDiscover = 50)
+        public async Task<List<VideoData>> MonitorChannel(string channelInput, int maxVideosToDiscover = 50, Action<string>? statusCallback = null)
         {
             string baseChannelUrl = NormalizeChannelUrl(channelInput);
             var discoveredVideos = new List<VideoData>();
@@ -582,7 +581,7 @@ namespace SimpleScraper
             int totalPages = 1; 
             int maxPagesToCheck = 10; // Limit how many pages to check during monitoring
             
-            Console.WriteLine($"Monitoring channel: {baseChannelUrl} (checking up to {maxPagesToCheck} pages or {maxVideosToDiscover} videos)");
+            statusCallback?.Invoke($"📡 Monitoring channel: {baseChannelUrl} (checking up to {maxPagesToCheck} pages or {maxVideosToDiscover} videos)");
 
             try
             {
@@ -599,7 +598,7 @@ namespace SimpleScraper
                         ? baseChannelUrl 
                         : $"{GetBaseUrlWithoutPage(baseChannelUrl)}?page={offset}";
                         
-                    Console.WriteLine($"Monitoring page {currentPage} (target: {Math.Min(totalPages, maxPagesToCheck)}) with FlareSolverr: {channelUrl}");
+                    statusCallback?.Invoke($"📄 Monitoring page {currentPage} (target: {Math.Min(totalPages, maxPagesToCheck)}) with FlareSolverr: {channelUrl}");
                     
                     string html = await GetPageContentWithRetry(channelUrl);
 
@@ -608,20 +607,20 @@ namespace SimpleScraper
                     
                     if (currentPage == 1)
                     {
-                        totalPages = ExtractTotalPages(doc, baseChannelUrl);
-                        Console.WriteLine($"Channel {baseChannelUrl} has {totalPages} total pages. Will check up to {Math.Min(totalPages, maxPagesToCheck)}.");
+                        totalPages = ExtractTotalPages(doc, baseChannelUrl, statusCallback);
+                        statusCallback?.Invoke($"📊 Channel {baseChannelUrl} has {totalPages} total pages. Will check up to {Math.Min(totalPages, maxPagesToCheck)}.");
                     }
 
-                    var videoNodes = FindVideoNodes(doc);
+                    var videoNodes = FindVideoNodes(doc, statusCallback);
                     if (videoNodes == null || videoNodes.Count == 0)
                     {
-                        Console.WriteLine($"No videos found on monitored page {currentPage} of {channelUrl}.");
+                        statusCallback?.Invoke($"⚠️ No videos found on monitored page {currentPage} of {channelUrl}.");
                         currentPage++;
                          if (currentPage > totalPages && totalPages > 0) break;
                         continue;
                     }
 
-                    Console.WriteLine($"Found {videoNodes.Count} video items on monitored page {currentPage}.");
+                    statusCallback?.Invoke($"🎬 Found {videoNodes.Count} video items on monitored page {currentPage}.");
 
                     foreach (var node in videoNodes)
                     {
@@ -666,11 +665,11 @@ namespace SimpleScraper
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error monitoring channel {baseChannelUrl}: {ex.Message}");
-                Console.WriteLine($"Stack Trace: {ex.StackTrace}");
+                statusCallback?.Invoke($"❌ Error monitoring channel {baseChannelUrl}: {ex.Message}");
+                statusCallback?.Invoke($"🔍 Stack Trace: {ex.StackTrace}");
             }
 
-            Console.WriteLine($"Monitoring scan complete for {baseChannelUrl}. Discovered {discoveredVideos.Count} potential videos.");
+            statusCallback?.Invoke($"✅ Monitoring scan complete for {baseChannelUrl}. Discovered {discoveredVideos.Count} potential videos.");
             return discoveredVideos;
         }
 
@@ -700,7 +699,7 @@ namespace SimpleScraper
             return channelInput;
         }
 
-        private HtmlNodeCollection FindVideoNodes(HtmlDocument doc)
+        private HtmlNodeCollection FindVideoNodes(HtmlDocument doc, Action<string>? statusCallback = null)
         {
             var possibleSelectors = new[]
             {
@@ -721,7 +720,7 @@ namespace SimpleScraper
                 var nodes = doc.DocumentNode.SelectNodes(selector);
                 if (nodes != null && nodes.Count > 0)
                 {
-                    Console.WriteLine($"Found {nodes.Count} video nodes with selector: {selector}");
+                    statusCallback?.Invoke($"🔍 Found {nodes.Count} video nodes with selector: {selector}");
                     return nodes;
                 }
             }
@@ -729,35 +728,36 @@ namespace SimpleScraper
             return null;
         }
 
-        public async Task<string> GetVideoSourceUrl(string postUrl)
+        public async Task<string?> GetVideoSourceUrl(string postUrl, Action<string>? statusCallback = null)
         {
             try
             {
-                Console.WriteLine($"Extracting .vid URL from: {postUrl}");
+                statusCallback?.Invoke($"🔗 Extracting video URL from: {postUrl.Split('/').LastOrDefault()?.Split('?').FirstOrDefault() ?? "post"}");
                 
                 string postId = ExtractPostIdFromUrl(postUrl);
                 
                 // Ensure we have a valid FlareSolverr client
                 if (_flareSolverr == null)
                 {
+                    statusCallback?.Invoke("🔧 Initializing FlareSolverr client...");
                     _flareSolverr = await FlareSolverrSessionManager.Instance.GetClientAsync();
                 }
                 
                 // Use FlareSolverr to get the video URL with retry logic
-                var videoUrl = await GetVideoUrlWithRetry(postUrl, postId);
+                var videoUrl = await GetVideoUrlWithRetry(postUrl, postId, statusCallback);
                 
                 if (!string.IsNullOrEmpty(videoUrl))
                 {
-                    Console.WriteLine($"✅ Successfully found video URL: {videoUrl}");
+                    statusCallback?.Invoke($"✅ Successfully found video URL!");
                     return videoUrl;
                 }
                 
-                Console.WriteLine($"❌ No video URL found for {postUrl}");
+                statusCallback?.Invoke($"❌ No video URL found");
                 return null;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error extracting video URL from {postUrl}: {ex.Message}");
+                statusCallback?.Invoke($"❌ Error: {ex.Message.Substring(0, Math.Min(50, ex.Message.Length))}...");
                 return null;
             }
         }
@@ -962,7 +962,7 @@ namespace SimpleScraper
             return string.Empty;
         }
 
-        private int ExtractTotalPages(HtmlDocument doc, string baseUrl)
+        private int ExtractTotalPages(HtmlDocument doc, string baseUrl, Action<string>? statusCallback = null)
         {
             try
             {
@@ -998,12 +998,12 @@ namespace SimpleScraper
                 // If we found the maximum offset, calculate the total pages
                 // Adding 1 to include the first page (which has offset 0)
                 int totalPages = (maxOffset / itemsPerPage) + 1;
-                Console.WriteLine($"Found pagination with max offset {maxOffset}, calculating {totalPages} total pages");
+                statusCallback?.Invoke($"📊 Found pagination with max offset {maxOffset}, calculating {totalPages} total pages");
                 return totalPages;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error extracting total pages: {ex.Message}");
+                statusCallback?.Invoke($"❌ Error extracting total pages: {ex.Message}");
                 return 1; // Default to 1 page on error
             }
         }
@@ -1053,7 +1053,7 @@ namespace SimpleScraper
             throw new Exception($"Failed to get page content after {maxRetries + 1} attempts");
         }
 
-        private async Task<string> GetVideoUrlWithRetry(string postUrl, string postId, int maxRetries = 2)
+        private async Task<string?> GetVideoUrlWithRetry(string postUrl, string postId, Action<string>? statusCallback = null, int maxRetries = 2)
         {
             for (int attempt = 0; attempt <= maxRetries; attempt++)
             {
@@ -1061,25 +1061,27 @@ namespace SimpleScraper
                 {
                     if (_flareSolverr == null)
                     {
+                        statusCallback?.Invoke("🔧 Getting FlareSolverr client...");
                         _flareSolverr = await FlareSolverrSessionManager.Instance.GetClientAsync();
                     }
                     
-                    return await _flareSolverr.GetVideoUrlFromPage(postUrl, postId);
+                    statusCallback?.Invoke($"🎯 Extracting video URL (attempt {attempt + 1}/{maxRetries + 1})...");
+                    return await _flareSolverr.GetVideoUrlFromPage(postUrl, postId, statusCallback);
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Video URL extraction attempt {attempt + 1} failed for {postUrl}: {ex.Message}");
+                    statusCallback?.Invoke($"⚠️ Attempt {attempt + 1} failed: {ex.Message.Substring(0, Math.Min(50, ex.Message.Length))}...");
                     
                     if (attempt < maxRetries)
                     {
-                        Console.WriteLine("Renewing FlareSolverr session and retrying...");
+                        statusCallback?.Invoke("🔄 Renewing FlareSolverr session and retrying...");
                         await FlareSolverrSessionManager.Instance.RenewSessionAsync();
                         _flareSolverr = await FlareSolverrSessionManager.Instance.GetClientAsync();
                         await Task.Delay(2000); // Wait before retry
                     }
                     else
                     {
-                        Console.WriteLine($"Failed to get video URL after {maxRetries + 1} attempts");
+                        statusCallback?.Invoke($"❌ Failed to get video URL after {maxRetries + 1} attempts");
                         return null;
                     }
                 }
