@@ -170,6 +170,38 @@ namespace SimpleScraper
             return Convert.ToInt32(result);
         }
 
+        public async Task<int> GetCompletedDownloadsCountAsync()
+        {
+            using var connection = new NpgsqlConnection(_connectionString);
+            await connection.OpenAsync();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                SELECT COUNT(*) 
+                FROM videos 
+                WHERE downloaded = TRUE;
+            ";
+
+            var result = await command.ExecuteScalarAsync();
+            return Convert.ToInt32(result);
+        }
+
+        public async Task<int> GetCompletedUploadsCountAsync()
+        {
+            using var connection = new NpgsqlConnection(_connectionString);
+            await connection.OpenAsync();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                SELECT COUNT(*) 
+                FROM videos 
+                WHERE is_uploaded_to_telegram = TRUE;
+            ";
+
+            var result = await command.ExecuteScalarAsync();
+            return Convert.ToInt32(result);
+        }
+
         public async Task<List<ChannelData>> GetActiveChannelsAsync()
         {
             using var connection = new NpgsqlConnection(_connectionString);

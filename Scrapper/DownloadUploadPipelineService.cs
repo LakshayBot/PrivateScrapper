@@ -313,22 +313,27 @@ namespace SimpleScraper
             // Calculate overall progress using database counts for accuracy
             int pendingDownloadsCount = 0;
             int pendingUploadsCount = 0;
-            int totalCompletedUploads = _completedUploads.Count;
+            int completedDownloadsCount = 0;
+            int completedUploadsCount = 0;
             
             try
             {
                 pendingDownloadsCount = await _dbService.GetUndownloadedVideosCountAsync();
                 pendingUploadsCount = await _dbService.GetPendingUploadsCountAsync();
+                completedDownloadsCount = await _dbService.GetCompletedDownloadsCountAsync();
+                completedUploadsCount = await _dbService.GetCompletedUploadsCountAsync();
             }
             catch (Exception)
             {
                 // Fallback to memory counts if database is unavailable
                 pendingDownloadsCount = _downloadQueue.Count;
                 pendingUploadsCount = _uploadQueue.Count;
+                completedDownloadsCount = _completedDownloads.Count;
+                completedUploadsCount = _completedUploads.Count;
             }
             
-            var totalVideos = totalCompletedUploads + pendingDownloadsCount + pendingUploadsCount + _downloadProgress.Count + _uploadProgress.Count;
-            var completedVideos = totalCompletedUploads;
+            var totalVideos = completedUploadsCount + pendingDownloadsCount + pendingUploadsCount + _downloadProgress.Count + _uploadProgress.Count;
+            var completedVideos = completedUploadsCount; // Only count fully completed (uploaded) videos as done
             var overallProgress = totalVideos > 0 ? (double)completedVideos / totalVideos * 100 : 0;
             
             // Calculate time estimates
@@ -448,8 +453,8 @@ namespace SimpleScraper
             sb.AppendLine("║   ┌─────────────────┬─────────┬─────────┬───────────┬─────────┐");
             sb.AppendLine("║   │ Stage           │ Active  │ Pending │ Completed │ Workers │");
             sb.AppendLine("║   ├─────────────────┼─────────┼─────────┼───────────┼─────────┤");
-            sb.AppendLine($"║   │ Downloads       │ {activeDownloads.Count,7} │ {pendingDownloadsCount,7} │ {_completedDownloads.Count,9} │ {activeDownloads.Count}/{_maxConcurrentDownloads,7} │");
-            sb.AppendLine($"║   │ Uploads         │ {activeUploads.Count,7} │ {pendingUploadsCount,7} │ {_completedUploads.Count,9} │ {activeUploads.Count}/{_maxConcurrentUploads,7} │");
+            sb.AppendLine($"║   │ Downloads       │ {activeDownloads.Count,7} │ {pendingDownloadsCount,7} │ {completedDownloadsCount,9} │ {activeDownloads.Count}/{_maxConcurrentDownloads,7} │");
+            sb.AppendLine($"║   │ Uploads         │ {activeUploads.Count,7} │ {pendingUploadsCount,7} │ {completedUploadsCount,9} │ {activeUploads.Count}/{_maxConcurrentUploads,7} │");
             sb.AppendLine("║   └─────────────────┴─────────┴─────────┴───────────┴─────────┘");
             
             sb.AppendLine("╚═══════════════════════════════════════════════════════════════════════════════╝");
