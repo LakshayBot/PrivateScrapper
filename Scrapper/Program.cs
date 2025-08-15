@@ -1,8 +1,8 @@
 ﻿using HtmlAgilityPack;
-using PuppeteerSharp;
 using System.Text.RegularExpressions;
 using System.Text.Json;
 using Npgsql;
+using PuppeteerSharp;
 
 namespace SimpleScraper
 {
@@ -90,13 +90,29 @@ namespace SimpleScraper
             // Default download directory
             string downloadDir = Path.Combine(Directory.GetCurrentDirectory(), "downloads");
             
+            // Telegram configuration (you can set these as environment variables or config file)
+            string telegramBotToken = "7033069921:AAHKwPLvbSsSpkncIv-eEgs_jt56fZLTF9g";
+            string telegramChatId = "-1002522142205";
+            string telegramServerUrl =  "http://192.168.1.3:8081";
+            
             // Initialize logger
             Logger.Initialize(Path.Combine(downloadDir, "logs"));
             Logger.Log($"Automated mode starting at {DateTime.Now}");
             Logger.Log($"Download directory: {downloadDir}");
             
+            if (!string.IsNullOrEmpty(telegramBotToken) && !string.IsNullOrEmpty(telegramChatId))
+            {
+                Logger.Log($"Telegram upload enabled - Server: {telegramServerUrl}, Chat ID: {telegramChatId}");
+            }
+            else
+            {
+                Logger.Log("Telegram upload disabled - missing bot token or chat ID");
+                Console.WriteLine("⚠️  Telegram upload disabled. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables to enable.");
+            }
+            
             // Create and start the automated service
-            using var automatedService = new AutomatedScraperService(connectionString, downloadDir);
+            using var automatedService = new AutomatedScraperService(connectionString, downloadDir, 
+                telegramBotToken, telegramChatId, telegramServerUrl);
             
             await automatedService.Initialize();
             
@@ -120,7 +136,12 @@ namespace SimpleScraper
             
             // Wait for processing to stop gracefully
             await processingTask;
-            Logger.Log("Automated processing stopped. Exiting...");
+            Logger.Log("Automated processing stopped. Cleaning up FlareSolverr session...");
+            
+            // Clean up the session manager
+            FlareSolverrSessionManager.Instance.Dispose();
+            
+            Logger.Log("Cleanup complete. Exiting...");
             Logger.Close();
         }
 
@@ -216,10 +237,96 @@ namespace SimpleScraper
             Console.Write("\nEnter download directory (leave empty for default): ");
             string downloadDir = Console.ReadLine();
             
-            var downloader = new VideoDownloader(dbService, 
-                string.IsNullOrWhiteSpace(downloadDir) ? null : downloadDir);
+            Console.Write("Number of concurrent downloads (default: 3): ");
+            string concurrentInput = Console.ReadLine();
+            int maxConcurrentDownloads = 3;
             
-            await downloader.DownloadAllUndownloadedVideosAsync();
+            if (!string.IsNullOrWhiteSpace(concurrentInput) && int.TryParse(concurrentInput, out int parsedConcurrent))
+            {
+                maxConcurrentDownloads = Math.Max(1, Math.Min(parsedConcurrent, 6)); // Limit to 1-6 concurrent downloads
+            }
+            
+            // Get all undownloaded videos
+            var videos = await dbService.GetUndownloadedVideosAsync();
+            
+            if (videos.Count == 0)
+            {
+                Console.WriteLine("No videos to download.");
+                return;
+            }
+            
+            Console.WriteLine($"Found {videos.Count} videos to download using {maxConcurrentDownloads} concurrent workers.");
+            
+            // Create pipeline service without Telegram upload (download only)
+            var pipelineService = new DownloadUploadPipelineService(
+                dbService, 
+                string.IsNullOrWhiteSpace(downloadDir) ? null : downloadDir,
+                null, // No bot token
+                null, // No chat ID  
+                null, // No telegram server URL
+                maxConcurrentDownloads,
+                0  // No upload workers
+            );
+            
+            try
+            {
+                // Initialize the shared browser
+                await pipelineService.InitializeAsync();
+                
+                // Start the workers
+                pipelineService.StartWorkers();
+                
+                // Update status to show we're processing videos
+                pipelineService.UpdateScrapeStatus($"📥 Processing {videos.Count} videos for download...");
+                
+                // Check and update video source URLs for any videos that don't have them
+                var videoScraper = new VideoScraper();
+                await videoScraper.Initialize();
+                
+                int processedCount = 0;
+                foreach (var video in videos)
+                {
+                    processedCount++;
+                    
+                    if (string.IsNullOrEmpty(video.VideoSourceUrl))
+                    {
+                        pipelineService.UpdateScrapeStatus($"🔗 Getting download URL for video {processedCount}/{videos.Count}: {video.Title}");
+                        try
+                        {
+                            string vidUrl = await videoScraper.GetVideoSourceUrl(video.Url);
+                            if (!string.IsNullOrEmpty(vidUrl))
+                            {
+                                video.VideoSourceUrl = vidUrl;
+                                await dbService.UpdateVideoSourceUrlAsync(video.Url, vidUrl);
+                                Console.WriteLine($"✅ Got source URL for: {video.Title}");
+                            }
+                            else
+                            {
+                                Console.WriteLine($"⚠️ Could not get source URL for: {video.Title}");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"❌ Error getting source URL for {video.Title}: {ex.Message}");
+                        }
+                    }
+                }
+                
+                videoScraper.Dispose();
+                
+                // Now start the downloads
+                pipelineService.UpdateScrapeStatus($"📥 Starting downloads for {videos.Count} videos...");
+                
+                // Process all videos
+                await pipelineService.ProcessVideosAsync(videos);
+                
+                pipelineService.UpdateScrapeStatus("✅ All downloads completed!");
+                Console.WriteLine($"\n✅ Completed downloading {videos.Count} videos.");
+            }
+            finally
+            {
+                pipelineService.Dispose();
+            }
         }
 
         // Extracted method to normalize channel input to a URL
@@ -298,7 +405,7 @@ namespace SimpleScraper
                 string downloadDir = Console.ReadLine();
                 
                 var downloader = new VideoDownloader(dbService, 
-                    string.IsNullOrWhiteSpace(downloadDir) ? null : downloadDir);
+                    string.IsNullOrWhiteSpace(downloadDir) ? null : downloadDir, scraper);
                 
                 foreach (var video in videos)
                 {
@@ -322,229 +429,249 @@ namespace SimpleScraper
 
     public class VideoScraper : IDisposable
     {
-        private readonly HttpClient _httpClient;
-        private IBrowser _browser;
+        private FlareSolverrClient? _flareSolverr;
         private const string BaseUrl = "https://sxyprn.com";
-
+        
         public VideoScraper()
         {
-            _httpClient = new HttpClient();
-            _httpClient.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
+            // FlareSolverr client will be obtained from session manager when needed
         }
-
+        
         public async Task Initialize()
         {
-            var browserFetcher = new BrowserFetcher();
-            await browserFetcher.DownloadAsync();
-            _browser = await Puppeteer.LaunchAsync(new LaunchOptions
+            Console.WriteLine("Initializing FlareSolverr connection...");
+            
+            // Get shared client from session manager
+            _flareSolverr = await FlareSolverrSessionManager.Instance.GetClientAsync();
+            
+            // Test with a simple request to verify everything works
+            try
             {
-                Headless = true,
-                Args = new[] { "--no-sandbox", "--disable-setuid-sandbox" }
-            });
+                await _flareSolverr.GetPageContentAsync(BaseUrl);
+                Console.WriteLine("✅ FlareSolverr initialized and tested successfully");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ FlareSolverr test failed: {ex.Message}");
+                throw;
+            }
         }
 
         public async Task<List<VideoData>> ScrapeChannel(string channelInput, int maxVideos = 10)
         {
             string baseChannelUrl = NormalizeChannelUrl(channelInput);
             var allVideos = new List<VideoData>();
-            int totalPagesScraped = 0;
-            int currentPage = 1;
-            int totalPages = 1; // We'll update this after parsing the first page
-            
-            Console.WriteLine($"Starting to scrape channel: {baseChannelUrl}");
-            
-            // Continue scraping until we reach the max videos or have scraped all pages
-            while (allVideos.Count < maxVideos && currentPage <= totalPages)
-            {
-                // Calculate the correct offset for the current page (0-based)
-                int offset = (currentPage - 1) * 30;
-                
-                // Construct the URL for the current page
-                string channelUrl = currentPage == 1 
-                    ? baseChannelUrl 
-                    : $"{GetBaseUrlWithoutPage(baseChannelUrl)}?page={offset}";
-                    
-                Console.WriteLine($"Fetching page {currentPage}/{totalPages} (offset: {offset}): {channelUrl}");
-                var html = await _httpClient.GetStringAsync(channelUrl);
-
-                var doc = new HtmlDocument();
-                doc.LoadHtml(html);
-                
-                // On the first page, find out how many pages there are in total
-                if (currentPage == 1)
-                {
-                    totalPages = ExtractTotalPages(doc, baseChannelUrl);
-                    Console.WriteLine($"Found a total of {totalPages} pages");
-                }
-
-                var videoNodes = FindVideoNodes(doc);
-                if (videoNodes == null || videoNodes.Count == 0)
-                {
-                    Console.WriteLine($"No videos found on page {currentPage}. Moving to next page.");
-                    currentPage++;
-                    continue;
-                }
-
-                Console.WriteLine($"Found {videoNodes.Count} videos on page {currentPage}. Processing...");
-                int processedCount = 0;
-
-                foreach (var node in videoNodes)
-                {
-                    if (allVideos.Count >= maxVideos)
-                        break;
-
-                    try
-                    {
-                        var title = ExtractTitle(node);
-                        var postUrl = ExtractUrl(node);
-
-                        if (string.IsNullOrEmpty(postUrl) || !postUrl.Contains("/post/"))
-                        {
-                            continue;
-                        }
-
-                        if (!postUrl.StartsWith("http"))
-                        {
-                            postUrl = postUrl.StartsWith("/") ? BaseUrl + postUrl : BaseUrl + "/" + postUrl;
-                        }
-
-                        var postId = ExtractPostIdFromUrl(postUrl);
-
-                        processedCount++;
-                        Console.WriteLine($"Processing video {processedCount}/{videoNodes.Count} on page {currentPage}: {title}");
-
-                        var video = new VideoData
-                        {
-                            Title = title,
-                            Url = postUrl,
-                            PostId = postId
-                        };
-
-                        // Get .vid URL from network traffic
-                        string vidUrl = await GetVideoSourceUrl(postUrl);
-                        if (!string.IsNullOrEmpty(vidUrl))
-                        {
-                            video.VideoSourceUrl = vidUrl;
-                            allVideos.Add(video);
-                            Console.WriteLine($"✅ Found .vid URL: {vidUrl}");
-                        }
-                        else
-                        {
-                            Console.WriteLine("❌ No .vid URL found for this video");
-                        }
-
-                        // Add a small delay between requests
-                        await Task.Delay(1500);
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Error processing a video: {ex.Message}");
-                    }
-                }
-
-                totalPagesScraped++;
-                currentPage++;
-                
-                // If this is not the last page, add a delay before fetching the next page
-                if (currentPage <= totalPages && allVideos.Count < maxVideos)
-                {
-                    Console.WriteLine($"Waiting 3 seconds before fetching the next page...");
-                    await Task.Delay(3000);
-                }
-            }
-
-            Console.WriteLine($"Pagination complete. Scraped {totalPagesScraped} pages out of {totalPages} total pages.");
-            return allVideos;
-        }
-
-        public async Task<List<VideoData>> MonitorChannel(string channelInput, int maxVideos = 300)
-        {
-            string baseChannelUrl = NormalizeChannelUrl(channelInput);
-            var allVideos = new List<VideoData>();
             int currentPage = 1;
             int totalPages = 1;
             
-            Console.WriteLine($"Monitoring channel: {baseChannelUrl}");
+            Console.WriteLine($"Starting to scrape channel: {baseChannelUrl}");
 
-            // We'll check only up to 3 pages when monitoring to avoid excessive requests
-            int maxPagesToCheck = 10;
-            
-            while (allVideos.Count < maxVideos && currentPage <= totalPages && currentPage <= maxPagesToCheck)
+            try
             {
-                // Calculate the correct offset for the current page (0-based)
-                int offset = (currentPage - 1) * 30;
-                
-                string channelUrl = currentPage == 1 
-                    ? baseChannelUrl 
-                    : $"{GetBaseUrlWithoutPage(baseChannelUrl)}?page={offset}";
+                // Ensure we have a valid FlareSolverr client
+                if (_flareSolverr == null)
+                {
+                    _flareSolverr = await FlareSolverrSessionManager.Instance.GetClientAsync();
+                }
+
+                while (allVideos.Count < maxVideos && currentPage <= totalPages)
+                {
+                    int offset = (currentPage - 1) * 30;
+                    string channelUrl = currentPage == 1 
+                        ? baseChannelUrl 
+                        : $"{GetBaseUrlWithoutPage(baseChannelUrl)}?page={offset}";
+                        
+                    Console.WriteLine($"Fetching page {currentPage} (target: {totalPages}) with FlareSolverr: {channelUrl}");
                     
-                Console.WriteLine($"Fetching page {currentPage}/{Math.Min(totalPages, maxPagesToCheck)} (offset: {offset}): {channelUrl}");
-                var html = await _httpClient.GetStringAsync(channelUrl);
+                    string html = await GetPageContentWithRetry(channelUrl);
 
-                var doc = new HtmlDocument();
-                doc.LoadHtml(html);
-                
-                if (currentPage == 1)
-                {
-                    totalPages = ExtractTotalPages(doc, baseChannelUrl);
-                    Console.WriteLine($"Found a total of {totalPages} pages, will check up to {Math.Min(totalPages, maxPagesToCheck)}");
-                }
+                    var doc = new HtmlDocument();
+                    doc.LoadHtml(html);
+                    
+                    if (currentPage == 1)
+                    {
+                        totalPages = ExtractTotalPages(doc, baseChannelUrl);
+                        Console.WriteLine($"Found a total of {totalPages} pages for channel {baseChannelUrl}");
+                    }
 
-                var videoNodes = FindVideoNodes(doc);
-                if (videoNodes == null || videoNodes.Count == 0)
-                {
-                    Console.WriteLine($"No videos found on page {currentPage}.");
+                    var videoNodes = FindVideoNodes(doc);
+                    if (videoNodes == null || videoNodes.Count == 0)
+                    {
+                        Console.WriteLine($"No videos found on page {currentPage} of {channelUrl}. Moving to next page or finishing.");
+                        currentPage++;
+                        if (currentPage > totalPages && totalPages > 0)
+                             break;
+                        continue;
+                    }
+
+                    Console.WriteLine($"Found {videoNodes.Count} videos on page {currentPage}. Processing...");
+                    int processedCountOnPage = 0;
+
+                    foreach (var node in videoNodes)
+                    {
+                        if (allVideos.Count >= maxVideos)
+                            break;
+
+                        try
+                        {
+                            var title = ExtractTitle(node);
+                            var postUrl = ExtractUrl(node);
+
+                            if (string.IsNullOrEmpty(postUrl) || !postUrl.Contains("/post/"))
+                            {
+                                continue;
+                            }
+
+                            if (!postUrl.StartsWith("http"))
+                            {
+                                postUrl = postUrl.StartsWith("/") ? BaseUrl + postUrl : BaseUrl + "/" + postUrl;
+                            }
+
+                            var postId = ExtractPostIdFromUrl(postUrl);
+                            processedCountOnPage++;
+                            Console.WriteLine($"Processing video {processedCountOnPage}/{videoNodes.Count} on page {currentPage}: {title.Substring(0, Math.Min(title.Length, 50))}");
+
+                            var video = new VideoData
+                            {
+                                Title = title,
+                                Url = postUrl,
+                                PostId = postId
+                            };
+
+                            string vidUrl = await GetVideoSourceUrl(postUrl);
+                            if (!string.IsNullOrEmpty(vidUrl))
+                            {
+                                video.VideoSourceUrl = vidUrl;
+                                allVideos.Add(video);
+                                Console.WriteLine($"✅ Found .vid URL for: {title.Substring(0, Math.Min(title.Length, 50))}");
+                            }
+                            else
+                            {
+                                Console.WriteLine($"❌ No .vid URL found for: {title.Substring(0, Math.Min(title.Length, 50))}");
+                            }
+                            await Task.Delay(1000); // Delay between processing individual videos
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Error processing a video item: {ex.Message}");
+                        }
+                    }
                     currentPage++;
-                    continue;
-                }
-
-                Console.WriteLine($"Found {videoNodes.Count} videos on page {currentPage}.");
-
-                foreach (var node in videoNodes)
-                {
-                    if (allVideos.Count >= maxVideos)
-                        break;
-
-                    try
+                    if (currentPage <= totalPages && allVideos.Count < maxVideos)
                     {
-                        var title = ExtractTitle(node);
-                        var postUrl = ExtractUrl(node);
-
-                        if (string.IsNullOrEmpty(postUrl) || !postUrl.Contains("/post/"))
-                        {
-                            continue;
-                        }
-
-                        if (!postUrl.StartsWith("http"))
-                        {
-                            postUrl = postUrl.StartsWith("/") ? BaseUrl + postUrl : BaseUrl + "/" + postUrl;
-                        }
-
-                        var postId = ExtractPostIdFromUrl(postUrl);
-
-                        allVideos.Add(new VideoData
-                        {
-                            Title = title,
-                            Url = postUrl,
-                            PostId = postId
-                        });
+                        Console.WriteLine($"Waiting 2 seconds before fetching next page...");
+                        await Task.Delay(2000); 
                     }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Error processing a video node: {ex.Message}");
-                    }
-                }
-
-                currentPage++;
-                
-                // If this is not the last page, add a small delay before fetching the next page
-                if (currentPage <= Math.Min(totalPages, maxPagesToCheck) && allVideos.Count < maxVideos)
-                {
-                    await Task.Delay(1500);
                 }
             }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error scraping channel {baseChannelUrl}: {ex.Message}");
+                Console.WriteLine($"Stack Trace: {ex.StackTrace}");
+            }
 
+            Console.WriteLine($"Channel scraping complete for {baseChannelUrl}. Found {allVideos.Count} videos.");
             return allVideos;
+        }
+
+        public async Task<List<VideoData>> MonitorChannel(string channelInput, int maxVideosToDiscover = 50)
+        {
+            string baseChannelUrl = NormalizeChannelUrl(channelInput);
+            var discoveredVideos = new List<VideoData>();
+            int currentPage = 1;
+            int totalPages = 1; 
+            int maxPagesToCheck = 10; // Limit how many pages to check during monitoring
+            
+            Console.WriteLine($"Monitoring channel: {baseChannelUrl} (checking up to {maxPagesToCheck} pages or {maxVideosToDiscover} videos)");
+
+            try
+            {
+                // Ensure we have a valid FlareSolverr client
+                if (_flareSolverr == null)
+                {
+                    _flareSolverr = await FlareSolverrSessionManager.Instance.GetClientAsync();
+                }
+
+                while (discoveredVideos.Count < maxVideosToDiscover && currentPage <= totalPages && currentPage <= maxPagesToCheck)
+                {
+                    int offset = (currentPage - 1) * 30;
+                    string channelUrl = currentPage == 1 
+                        ? baseChannelUrl 
+                        : $"{GetBaseUrlWithoutPage(baseChannelUrl)}?page={offset}";
+                        
+                    Console.WriteLine($"Monitoring page {currentPage} (target: {Math.Min(totalPages, maxPagesToCheck)}) with FlareSolverr: {channelUrl}");
+                    
+                    string html = await GetPageContentWithRetry(channelUrl);
+
+                    var doc = new HtmlDocument();
+                    doc.LoadHtml(html);
+                    
+                    if (currentPage == 1)
+                    {
+                        totalPages = ExtractTotalPages(doc, baseChannelUrl);
+                        Console.WriteLine($"Channel {baseChannelUrl} has {totalPages} total pages. Will check up to {Math.Min(totalPages, maxPagesToCheck)}.");
+                    }
+
+                    var videoNodes = FindVideoNodes(doc);
+                    if (videoNodes == null || videoNodes.Count == 0)
+                    {
+                        Console.WriteLine($"No videos found on monitored page {currentPage} of {channelUrl}.");
+                        currentPage++;
+                         if (currentPage > totalPages && totalPages > 0) break;
+                        continue;
+                    }
+
+                    Console.WriteLine($"Found {videoNodes.Count} video items on monitored page {currentPage}.");
+
+                    foreach (var node in videoNodes)
+                    {
+                        if (discoveredVideos.Count >= maxVideosToDiscover)
+                            break;
+
+                        try
+                        {
+                            var title = ExtractTitle(node);
+                            var postUrl = ExtractUrl(node);
+
+                            if (string.IsNullOrEmpty(postUrl) || !postUrl.Contains("/post/"))
+                            {
+                                continue;
+                            }
+
+                            if (!postUrl.StartsWith("http"))
+                            {
+                                postUrl = postUrl.StartsWith("/") ? BaseUrl + postUrl : BaseUrl + "/" + postUrl;
+                            }
+                            var postId = ExtractPostIdFromUrl(postUrl);
+
+                            // For monitoring, we just collect basic info. The .vid URL will be fetched later if it's new.
+                            discoveredVideos.Add(new VideoData
+                            {
+                                Title = title,
+                                Url = postUrl,
+                                PostId = postId
+                            });
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Error processing a video node during monitoring: {ex.Message}");
+                        }
+                    }
+                    currentPage++;
+                    if (currentPage <= Math.Min(totalPages, maxPagesToCheck) && discoveredVideos.Count < maxVideosToDiscover)
+                    {
+                        await Task.Delay(1500); // Delay before fetching next page in monitoring
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error monitoring channel {baseChannelUrl}: {ex.Message}");
+                Console.WriteLine($"Stack Trace: {ex.StackTrace}");
+            }
+
+            Console.WriteLine($"Monitoring scan complete for {baseChannelUrl}. Discovered {discoveredVideos.Count} potential videos.");
+            return discoveredVideos;
         }
 
         private string NormalizeChannelUrl(string channelInput)
@@ -598,7 +725,7 @@ namespace SimpleScraper
                     return nodes;
                 }
             }
-
+            
             return null;
         }
 
@@ -607,44 +734,181 @@ namespace SimpleScraper
             try
             {
                 Console.WriteLine($"Extracting .vid URL from: {postUrl}");
-                using var page = await _browser.NewPageAsync();
-                await page.SetViewportAsync(new ViewPortOptions { Width = 1280, Height = 800 });
-                await page.SetRequestInterceptionAsync(true);
-
-                string videoUrl = null;
+                
                 string postId = ExtractPostIdFromUrl(postUrl);
-
-                page.Request += async (sender, e) =>
+                
+                // Ensure we have a valid FlareSolverr client
+                if (_flareSolverr == null)
                 {
-                    var url = e.Request.Url;
-                    if (url.Contains(".vid") && url.Contains(postId))
-                    {
-                        videoUrl = url;
-                    }
-                    await e.Request.ContinueAsync();
-                };
-
-                await page.GoToAsync(postUrl, new NavigationOptions
-                {
-                    WaitUntil = new[] { WaitUntilNavigation.Networkidle2 }
-                });
-
-                // Wait for the .vid request to appear (up to 10 seconds)
-                int waitTime = 0;
-                int maxWaitTime = 10000; // 10 seconds
-
-                while (string.IsNullOrEmpty(videoUrl) && waitTime < maxWaitTime)
-                {
-                    await Task.Delay(500);
-                    waitTime += 500;
+                    _flareSolverr = await FlareSolverrSessionManager.Instance.GetClientAsync();
                 }
-
-                return videoUrl;
+                
+                // Use FlareSolverr to get the video URL with retry logic
+                var videoUrl = await GetVideoUrlWithRetry(postUrl, postId);
+                
+                if (!string.IsNullOrEmpty(videoUrl))
+                {
+                    Console.WriteLine($"✅ Successfully found video URL: {videoUrl}");
+                    return videoUrl;
+                }
+                
+                Console.WriteLine($"❌ No video URL found for {postUrl}");
+                return null;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error extracting video source: {ex.Message}");
+                Console.WriteLine($"Error extracting video URL from {postUrl}: {ex.Message}");
                 return null;
+            }
+        }
+
+        private async Task<string> GetVidUrlViaPuppeteer(string postUrl, string postId)
+        {
+            try
+            {
+                Console.WriteLine($"🎬 Using Puppeteer to click video and capture network requests for {postId}");
+                
+                // Import PuppeteerSharp for this specific task
+                using var browser = await PuppeteerSharp.Puppeteer.LaunchAsync(new PuppeteerSharp.LaunchOptions
+                {
+                    Headless = false,
+                    Args = new[] { "--no-sandbox", "--disable-setuid-sandbox" }
+                });
+                
+                using var page = await browser.NewPageAsync();
+                
+                // Set up network request interception to capture .vid URLs
+                var vidUrl = "";
+                page.Response += (sender, e) =>
+                {
+                    if (e.Response.Url.Contains(postId) && e.Response.Url.EndsWith(".vid"))
+                    {
+                        Console.WriteLine($"🎯 Captured .vid URL from network: {e.Response.Url}");
+                        vidUrl = e.Response.Url;
+                    }
+                };
+                
+                // Navigate to the post page
+                Console.WriteLine($"🌐 Navigating to post page: {postUrl}");
+                await page.GoToAsync(postUrl, new PuppeteerSharp.NavigationOptions
+                {
+                    WaitUntil = new[] { PuppeteerSharp.WaitUntilNavigation.Networkidle2 },
+                    Timeout = 30000
+                });
+                
+                // Wait for the video element to be present
+                await page.WaitForSelectorAsync("video#player_el, video.player_el", new PuppeteerSharp.WaitForSelectorOptions
+                {
+                    Timeout = 10000
+                });
+                
+                Console.WriteLine("📹 Found video player element, clicking to trigger network requests...");
+                
+                // Click on the video to trigger the .vid URL request
+                await page.ClickAsync("video#player_el, video.player_el");
+                
+                // Wait a bit for the network request to complete
+                await Task.Delay(3000);
+                
+                // Try to play the video if clicking didn't work
+                if (string.IsNullOrEmpty(vidUrl))
+                {
+                    Console.WriteLine("� Trying to play video via JavaScript...");
+                    await page.EvaluateExpressionAsync(@"
+                        const video = document.querySelector('video#player_el, video.player_el');
+                        if (video) {
+                            video.play();
+                        }
+                    ");
+                    
+                    // Wait for network requests
+                    await Task.Delay(3000);
+                }
+                
+                // If still no URL, try triggering load event
+                if (string.IsNullOrEmpty(vidUrl))
+                {
+                    Console.WriteLine("🔄 Trying to trigger video load event...");
+                    await page.EvaluateExpressionAsync(@"
+                        const video = document.querySelector('video#player_el, video.player_el');
+                        if (video) {
+                            video.load();
+                            video.currentTime = 0.1;
+                        }
+                    ");
+                    
+                    // Wait for network requests
+                    await Task.Delay(2000);
+                }
+                
+                if (!string.IsNullOrEmpty(vidUrl))
+                {
+                    Console.WriteLine($"✅ Successfully captured .vid URL: {vidUrl}");
+                    return vidUrl;
+                }
+                
+                Console.WriteLine("❌ No .vid URL captured from network requests");
+                return "";
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error using Puppeteer to get .vid URL: {ex.Message}");
+                return "";
+            }
+        }
+
+        private async Task<string> TryGetActualVidUrl(string postUrl, string postId, string directVidUrl)
+        {
+            try
+            {
+                Console.WriteLine($"Attempting to get actual .vid URL via: {directVidUrl}");
+                
+                // Try to follow the redirect chain to get the final trafficdeposit.com URL
+                using var httpClient = new HttpClient();
+                httpClient.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+                httpClient.DefaultRequestHeaders.Add("Referer", postUrl);
+                httpClient.DefaultRequestHeaders.Add("Accept", "*/*");
+                
+                var response = await httpClient.GetAsync(directVidUrl);
+                
+                // Check if we got a redirect response
+                if (response.StatusCode == System.Net.HttpStatusCode.Found || 
+                    response.StatusCode == System.Net.HttpStatusCode.MovedPermanently ||
+                    response.StatusCode == System.Net.HttpStatusCode.TemporaryRedirect)
+                {
+                    var location = response.Headers.Location?.ToString();
+                    if (!string.IsNullOrEmpty(location) && location.Contains("trafficdeposit.com") && location.EndsWith(".vid"))
+                    {
+                        Console.WriteLine($"✅ Found actual .vid URL via redirect: {location}");
+                        return location;
+                    }
+                }
+                
+                // If direct response contains the URL
+                var responseContent = await response.Content.ReadAsStringAsync();
+                if (response.IsSuccessStatusCode && !string.IsNullOrEmpty(responseContent))
+                {
+                    // Check if the response itself is the video URL
+                    if (responseContent.StartsWith("http") && responseContent.Contains("trafficdeposit.com") && responseContent.EndsWith(".vid"))
+                    {
+                        Console.WriteLine($"✅ Found actual .vid URL in response: {responseContent.Trim()}");
+                        return responseContent.Trim();
+                    }
+                    
+                    // If we got a successful response, the direct URL might work
+                    if (directVidUrl.Contains("trafficdeposit.com") || response.IsSuccessStatusCode)
+                    {
+                        Console.WriteLine($"✅ Direct .vid URL appears to be valid: {directVidUrl}");
+                        return directVidUrl;
+                    }
+                }
+                
+                return "";
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error trying to get actual .vid URL: {ex.Message}");
+                return "";
             }
         }
 
@@ -755,18 +1019,79 @@ namespace SimpleScraper
             return url;
         }
 
+        private async Task<string> GetPageContentWithRetry(string url, int maxRetries = 2)
+        {
+            for (int attempt = 0; attempt <= maxRetries; attempt++)
+            {
+                try
+                {
+                    if (_flareSolverr == null)
+                    {
+                        _flareSolverr = await FlareSolverrSessionManager.Instance.GetClientAsync();
+                    }
+                    
+                    return await _flareSolverr.GetPageContentAsync(url);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Attempt {attempt + 1} failed for {url}: {ex.Message}");
+                    
+                    if (attempt < maxRetries)
+                    {
+                        Console.WriteLine("Renewing FlareSolverr session and retrying...");
+                        await FlareSolverrSessionManager.Instance.RenewSessionAsync();
+                        _flareSolverr = await FlareSolverrSessionManager.Instance.GetClientAsync();
+                        await Task.Delay(2000); // Wait before retry
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
+            }
+            
+            throw new Exception($"Failed to get page content after {maxRetries + 1} attempts");
+        }
+
+        private async Task<string> GetVideoUrlWithRetry(string postUrl, string postId, int maxRetries = 2)
+        {
+            for (int attempt = 0; attempt <= maxRetries; attempt++)
+            {
+                try
+                {
+                    if (_flareSolverr == null)
+                    {
+                        _flareSolverr = await FlareSolverrSessionManager.Instance.GetClientAsync();
+                    }
+                    
+                    return await _flareSolverr.GetVideoUrlFromPage(postUrl, postId);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Video URL extraction attempt {attempt + 1} failed for {postUrl}: {ex.Message}");
+                    
+                    if (attempt < maxRetries)
+                    {
+                        Console.WriteLine("Renewing FlareSolverr session and retrying...");
+                        await FlareSolverrSessionManager.Instance.RenewSessionAsync();
+                        _flareSolverr = await FlareSolverrSessionManager.Instance.GetClientAsync();
+                        await Task.Delay(2000); // Wait before retry
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Failed to get video URL after {maxRetries + 1} attempts");
+                        return null;
+                    }
+                }
+            }
+            
+            return null;
+        }
+
         public void Dispose()
         {
-            try
-            {
-                _browser?.CloseAsync().Wait();
-                _browser?.Dispose();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error disposing browser: {ex.Message}");
-            }
-            _httpClient?.Dispose();
+            // Don't dispose the FlareSolverr client directly since it's managed by the session manager
+            // The session manager will handle cleanup when the application shuts down
         }
     }
 }

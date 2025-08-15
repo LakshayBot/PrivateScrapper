@@ -1,0 +1,278 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace SimpleScraper
+{
+    public class AutomatedScraperService : IDisposable
+    {
+        private readonly DatabaseService _dbService;
+        private readonly VideoScraper _scraper;
+        private readonly DownloadUploadPipelineService _pipelineService;
+        private readonly CancellationTokenSource _cancellationSource;
+        private readonly SemaphoreSlim _channelProcessingSemaphore;
+        private readonly int _maxConcurrentChannels;
+        private bool _isRunning;
+        private readonly string _downloadDirectory;
+        
+        // Configuration for Telegram - mirroring your script
+        private const string BotToken = "7033069921:AAHKwPLvbSsSpkncIv-eEgs_jt56fZLTF9g";
+        private const string ChatId = "-1002522142205";
+        private const string TelegramServerUrl = "http://192.168.1.3:8081";
+
+        public AutomatedScraperService(string connectionString, string downloadDirectory = null, int maxConcurrentChannels = 3, int maxConcurrentDownloads = 3, int maxConcurrentUploads = 2)
+        {
+            _dbService = new DatabaseService(connectionString);
+            _scraper = new VideoScraper();
+            _downloadDirectory = downloadDirectory ?? Path.Combine(Directory.GetCurrentDirectory(), "downloads");
+            _maxConcurrentChannels = maxConcurrentChannels;
+            _channelProcessingSemaphore = new SemaphoreSlim(maxConcurrentChannels, maxConcurrentChannels);
+            _cancellationSource = new CancellationTokenSource();
+            
+            // Initialize the logger
+            string logDir = Path.Combine(_downloadDirectory, "logs");
+            if (!Directory.Exists(logDir)) Directory.CreateDirectory(logDir);
+            Logger.Initialize(logDir);
+
+            // Initialize the new pipeline service
+            _pipelineService = new DownloadUploadPipelineService(
+                _dbService, 
+                _downloadDirectory, 
+                BotToken, 
+                ChatId, 
+                TelegramServerUrl,
+                maxConcurrentDownloads,
+                maxConcurrentUploads);
+        }
+        
+        public async Task Initialize()
+        {
+            Console.WriteLine("Initializing automated scraper service...");
+            await _dbService.InitializeDatabaseAsync();
+            await _scraper.Initialize();
+            
+            // Start the pipeline workers
+            _pipelineService.StartWorkers();
+            
+            // Process any existing undownloaded videos
+            await _pipelineService.ProcessExistingUndownloadedVideos();
+            
+            Console.WriteLine("Automated scraper service initialized successfully.");
+        }
+        
+        public async Task StartAutomatedProcessing()
+        {
+            if (_isRunning)
+            {
+                Console.WriteLine("Automated processing is already running.");
+                return;
+            }
+            
+            _isRunning = true;
+            Logger.Log("Starting automated processing...");
+            
+            // Track the last check time for each channel
+            var lastCheckTimes = new ConcurrentDictionary<int, DateTime>();
+            
+            try
+            {
+                while (!_cancellationSource.Token.IsCancellationRequested)
+                {
+                    // 1. Get all active channels from the database
+                    var activeChannels = await _dbService.GetActiveChannelsAsync();
+                    
+                    if (activeChannels.Count == 0)
+                    {
+                        Logger.Log("No active channels found. Waiting 5 minutes before checking again...");
+                        await Task.Delay(TimeSpan.FromMinutes(5), _cancellationSource.Token);
+                        continue;
+                    }
+                    
+                    // 2. Check which channels need processing based on their intervals
+                    var channelsToProcess = new List<ChannelData>();
+                    var now = DateTime.Now;
+                    
+                    foreach (var channel in activeChannels)
+                    {
+                        var lastCheckTime = lastCheckTimes.GetOrAdd(channel.Id, DateTime.MinValue);
+                        var timeSinceLastCheck = now - lastCheckTime;
+                        var checkInterval = TimeSpan.FromMinutes(channel.CheckIntervalMinutes);
+                        
+                        if (timeSinceLastCheck >= checkInterval)
+                        {
+                            channelsToProcess.Add(channel);
+                        }
+                    }
+                    
+                    // 3. Process channels in parallel
+                    if (channelsToProcess.Count > 0)
+                    {
+                        Logger.Log($"Found {channelsToProcess.Count} channels due for checking. Processing with {_maxConcurrentChannels} concurrent workers...");
+                        
+                        var channelTasks = channelsToProcess.Select(async channel =>
+                        {
+                            await _channelProcessingSemaphore.WaitAsync(_cancellationSource.Token);
+                            try
+                            {
+                                if (_cancellationSource.Token.IsCancellationRequested)
+                                    return;
+                                    
+                                await ProcessChannel(channel);
+                                lastCheckTimes[channel.Id] = DateTime.Now;
+                            }
+                            finally
+                            {
+                                _channelProcessingSemaphore.Release();
+                            }
+                        }).ToArray();
+                        
+                        await Task.WhenAll(channelTasks);
+                    }
+                    else
+                    {
+                        Logger.Log("No channels due for checking at this time.");
+                    }
+                    
+                    // 4. Wait a minute before the next check cycle
+                    Logger.Log($"Waiting 1 minute before checking channel schedules again...");
+                    await Task.Delay(TimeSpan.FromMinutes(1), _cancellationSource.Token);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                Logger.Log("Automated processing was canceled.");
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"Error in automated processing: {ex.Message}");
+                Logger.Log(ex.StackTrace);
+            }
+            finally
+            {
+                _isRunning = false;
+            }
+        }
+        
+        private async Task ProcessChannel(ChannelData channel)
+        {
+            try
+            {
+                Logger.Log($"[{DateTime.Now}] Processing channel: {channel.Name} (ID: {channel.Id})");
+                Logger.Log($"Check interval: {channel.CheckIntervalMinutes} minutes");
+                
+                // 1. Monitor the channel for potential videos
+                var potentialVideos = await _scraper.MonitorChannel(channel.Url, 500);
+                Logger.Log($"Found {potentialVideos.Count} potential videos on {channel.Name}");
+                
+                if (potentialVideos.Count == 0)
+                {
+                    await _dbService.UpdateChannelLastCheckedAsync(channel.Id);
+                    return;
+                }
+                
+                // 2. Filter to get only videos that don't exist in our database
+                int checkedCount = 0;
+                int newVideoCount = 0;
+                var newVideos = new List<VideoData>();
+                
+                // Process videos in parallel
+                var semaphore = new SemaphoreSlim(5, 5); // Limit concurrent video processing
+                var videoTasks = potentialVideos.Select(async video =>
+                {
+                    await semaphore.WaitAsync(_cancellationSource.Token);
+                    try
+                    {
+                        if (_cancellationSource.Token.IsCancellationRequested)
+                            return;
+                            
+                        Interlocked.Increment(ref checkedCount);
+                        
+                        if (checkedCount % 10 == 0)
+                        {
+                            Logger.Log($"Checked {checkedCount}/{potentialVideos.Count} videos...");
+                        }
+                        
+                        bool exists = await _dbService.VideoExistsAsync(video.Url);
+                        
+                        if (!exists)
+                        {
+                            string vidUrl = await _scraper.GetVideoSourceUrl(video.Url);
+                            
+                            if (!string.IsNullOrEmpty(vidUrl))
+                            {
+                                video.VideoSourceUrl = vidUrl;
+                                lock (newVideos)
+                                {
+                                    newVideos.Add(video);
+                                    newVideoCount++;
+                                }
+                                Logger.Log($"New video found ({newVideoCount}): {video.Title}");
+                            }
+                            
+                            // Add a delay between requests
+                            await Task.Delay(1500, _cancellationSource.Token);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Log($"Error processing video {video.Url}: {ex.Message}");
+                    }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                }).ToArray();
+                
+                await Task.WhenAll(videoTasks);
+                
+                // 3. Save new videos to database and add to download queue
+                if (newVideos.Count > 0)
+                {
+                    Logger.Log($"Saving {newVideos.Count} new videos to database from {channel.Name}...");
+                    await _dbService.SaveVideosAsync(newVideos);
+                    
+                    // Add to download queue for parallel processing
+                    _pipelineService.AddToDownloadQueue(newVideos);
+                    Logger.Log($"Videos saved and queued for download from {channel.Name}");
+                }
+                else
+                {
+                    Logger.Log($"No new videos found for {channel.Name}");
+                }
+                
+                // 4. Update last checked timestamp for this channel
+                await _dbService.UpdateChannelLastCheckedAsync(channel.Id);
+                Logger.Log($"Updated last checked time for {channel.Name}");
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"Error processing channel {channel.Name}: {ex.Message}");
+            }
+        }
+        
+        public void StopAutomatedProcessing()
+        {
+            if (_isRunning)
+            {
+                Logger.Log("Stopping automated processing...");
+                _cancellationSource.Cancel();
+            }
+        }
+        
+        public void Dispose()
+        {
+            StopAutomatedProcessing();
+            
+            // Stop workers synchronously
+            _pipelineService?.StopWorkers().Wait();
+            _pipelineService?.Dispose();
+            _scraper?.Dispose();
+            _channelProcessingSemaphore?.Dispose();
+            _cancellationSource?.Dispose();
+        }
+    }
+}

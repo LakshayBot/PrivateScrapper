@@ -20,11 +20,11 @@ namespace SimpleScraper
                     Directory.CreateDirectory(directory);
                 }
 
-                // Create log file with timestamp
-                string timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
-                _logFilePath = Path.Combine(directory, $"scraper_{timestamp}.log");
+                // Create log file with date only (one file per day)
+                string dateStamp = DateTime.Now.ToString("yyyy-MM-dd");
+                _logFilePath = Path.Combine(directory, $"scraper_{dateStamp}.log");
                 
-                // Open log file
+                // Open log file in append mode so multiple runs on same day go to same file
                 _logWriter = new StreamWriter(_logFilePath, true);
                 _logWriter.AutoFlush = true;
                 

@@ -29,6 +29,9 @@ namespace SimpleScraper
                     downloaded BOOLEAN DEFAULT FALSE,
                     download_path TEXT,
                     download_date TIMESTAMP,
+                    is_uploaded_to_telegram BOOLEAN DEFAULT FALSE,
+                    telegram_message_id TEXT,
+                    telegram_upload_attempt_timestamp TIMESTAMP,
                     scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             ";
@@ -111,7 +114,8 @@ namespace SimpleScraper
             command.CommandText = @"
                 SELECT title, url, video_source_url, post_id 
                 FROM videos 
-                WHERE downloaded = FALSE AND video_source_url IS NOT NULL
+                WHERE (downloaded = FALSE OR downloaded IS NULL) 
+                  AND video_source_url IS NOT NULL
                 ORDER BY scraped_at DESC;
             ";
 
@@ -233,6 +237,104 @@ namespace SimpleScraper
             command.Parameters.AddWithValue("videoSourceUrl", videoSourceUrl);
 
             await command.ExecuteNonQueryAsync();
+        }
+
+        // Telegram-related methods
+        public async Task MarkVideoAsTelegramUploadedAsync(string url, string messageId = null)
+        {
+            using var connection = new NpgsqlConnection(_connectionString);
+            await connection.OpenAsync();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                UPDATE videos 
+                SET is_uploaded_to_telegram = TRUE,
+                    telegram_message_id = @messageId
+                WHERE url = @url;
+            ";
+            command.Parameters.AddWithValue("url", url);
+            command.Parameters.AddWithValue("messageId", messageId ?? (object)DBNull.Value);
+
+            await command.ExecuteNonQueryAsync();
+        }
+
+        public async Task UpdateTelegramUploadAttemptTimestampAsync(string url)
+        {
+            using var connection = new NpgsqlConnection(_connectionString);
+            await connection.OpenAsync();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                UPDATE videos 
+                SET telegram_upload_attempt_timestamp = CURRENT_TIMESTAMP
+                WHERE url = @url;
+            ";
+            command.Parameters.AddWithValue("url", url);
+
+            await command.ExecuteNonQueryAsync();
+        }
+
+        public async Task<List<VideoData>> GetDownloadedButNotUploadedVideosAsync()
+        {
+            using var connection = new NpgsqlConnection(_connectionString);
+            await connection.OpenAsync();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                SELECT title, url, video_source_url, post_id, download_path
+                FROM videos 
+                WHERE downloaded = TRUE 
+                  AND (is_uploaded_to_telegram = FALSE OR is_uploaded_to_telegram IS NULL)
+                  AND download_path IS NOT NULL
+                ORDER BY download_date ASC;
+            ";
+
+            using var reader = await command.ExecuteReaderAsync();
+            var videos = new List<VideoData>();
+
+            while (await reader.ReadAsync())
+            {
+                videos.Add(new VideoData
+                {
+                    Title = reader.GetString(0),
+                    Url = reader.GetString(1),
+                    VideoSourceUrl = !reader.IsDBNull(2) ? reader.GetString(2) : null,
+                    PostId = !reader.IsDBNull(3) ? reader.GetString(3) : null,
+                    DownloadPath = !reader.IsDBNull(4) ? reader.GetString(4) : null
+                });
+            }
+
+            return videos;
+        }
+
+        public async Task<List<VideoData>> GetVideosMissingSourceUrlAsync(int limit = 20)
+        {
+            using var connection = new NpgsqlConnection(_connectionString);
+            await connection.OpenAsync();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                SELECT title, url, post_id 
+                FROM videos 
+                WHERE (downloaded = FALSE OR downloaded IS NULL)
+                  AND video_source_url IS NULL
+                ORDER BY scraped_at DESC
+                LIMIT @limit;
+            ";
+            command.Parameters.AddWithValue("limit", limit);
+
+            using var reader = await command.ExecuteReaderAsync();
+            var videos = new List<VideoData>();
+            while (await reader.ReadAsync())
+            {
+                videos.Add(new VideoData
+                {
+                    Title = reader.GetString(0),
+                    Url = reader.GetString(1),
+                    PostId = !reader.IsDBNull(2) ? reader.GetString(2) : null
+                });
+            }
+            return videos;
         }
     }
 }
